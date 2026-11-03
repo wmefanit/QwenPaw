@@ -95,11 +95,15 @@ class AgentMode:
 
 
 def find_active_explicit_mode(ctx: HookContext) -> str | None:
-    """Return the active non-default mode for one request context."""
+    """Return the active loop mode for one request context.
+
+    The internal ``coding`` plugin adds optional code tools and context;
+    it is not a competing loop mode.
+    """
     plugins = getattr(getattr(ctx, "workspace", None), "plugins", None)
     for mode in getattr(plugins, "modes", []):
         name = getattr(mode, "name", "")
-        if not name or name in {"default", "custom-loop-control"}:
+        if not name or name in {"default", "custom-loop-control", "coding"}:
             continue
         try:
             if mode.is_active(ctx):
