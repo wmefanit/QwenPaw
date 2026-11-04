@@ -1197,7 +1197,7 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
           },
         );
         if (remaining.length === inputs.length) continue;
-        if (remaining.length) card.data.input = remaining;
+        if (remaining.length && card?.data) card.data.input = remaining;
         else messages.splice(index, 1);
       }
     } else {

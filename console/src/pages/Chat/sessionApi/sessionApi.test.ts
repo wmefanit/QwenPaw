@@ -290,7 +290,10 @@ describe("pending batched user-message recovery", () => {
     const session = await sessionApi.getSession(chatId);
     const restored = session.messages
       .filter((message) => message.role === "user")
-      .flatMap((message) => message.cards?.[0]?.data?.input ?? []);
+      .flatMap((message) => message.cards?.[0]?.data?.input ?? []) as Array<{
+      content: Array<{ text?: string }>;
+      metadata?: Record<string, unknown>;
+    }>;
 
     expect(restored).toHaveLength(2);
     expect(restored.map((entry) => entry.content[0].text)).toEqual([
@@ -344,7 +347,10 @@ describe("pending batched user-message recovery", () => {
     const userMessage = session.messages.find(
       (message) => message.role === "user",
     );
-    const restored = userMessage?.cards?.[0]?.data?.input ?? [];
+    const restored = (userMessage?.cards?.[0]?.data?.input ?? []) as Array<{
+      content: Array<{ text?: string }>;
+      metadata?: Record<string, unknown>;
+    }>;
 
     expect(session.messages[0].role).toBe("user");
     expect(session.messages[1].role).toBe("assistant");
