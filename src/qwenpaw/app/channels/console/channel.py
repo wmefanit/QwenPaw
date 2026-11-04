@@ -23,8 +23,10 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from qwenpaw.schemas import (
+    AgentRequest,
     MessageType,
     Message,
+    Role,
     RunStatus,
 )
 
@@ -256,26 +258,32 @@ class ConsoleChannel(BaseChannel):
 
     def build_agent_request_from_native(self, native_payload: Any) -> Any:
         """
-        Build AgentRequest from console native payload (dict with
-        channel_id, sender_id, content_parts, meta). content_parts are
-        runtime Content types.
+        Build AgentRequest from console native payload.
+
+        ``message_groups`` is the authoritative structure: each group is an
+        independent user message (pi-mono model). ``content_parts`` remains
+        the flattened view required by the BaseChannel contract
+        (``_is_native_payload``, debounce, title extraction); when
+        ``message_groups`` is absent it is used as a single group.
         """
         payload = native_payload if isinstance(native_payload, dict) else {}
         channel_id = payload.get("channel_id") or self.channel
         sender_id = payload.get("sender_id") or ""
-        content_parts = payload.get("content_parts") or []
         meta = payload.get("meta") or {}
         session_id = self.resolve_session_id(sender_id, meta)
-        request = self.build_agent_request_from_user_content(
-            channel_id=channel_id,
-            sender_id=sender_id,
+
+        groups = payload.get("message_groups") or [
+            {
+                "content": payload.get("content_parts") or [],
+                "metadata": payload.get("message_metadata"),
+            },
+        ]
+        request = AgentRequest(
             session_id=session_id,
-            content_parts=content_parts,
-            channel_meta=meta,
+            user_id=sender_id,
+            input=[self._build_user_message(group) for group in groups],
+            channel=channel_id,
         )
-        message_metadata = payload.get("message_metadata")
-        if isinstance(message_metadata, dict) and request.input:
-            request.input[0].metadata = message_metadata
         request.channel_meta = meta
         rc = meta.get("request_context")
         if isinstance(rc, dict) and rc:
@@ -284,6 +292,22 @@ class ConsoleChannel(BaseChannel):
         if mso is not None:
             request.model_slot_override = mso
         return request
+
+    @staticmethod
+    def _build_user_message(group: Dict[str, Any]) -> Message:
+        """Build one user Message from a single message group."""
+        content = list(group.get("content") or [])
+        if not content:
+            content = [TextContent(type=ContentType.TEXT, text=" ")]
+        msg = Message(
+            type=MessageType.MESSAGE,
+            role=Role.USER,
+            content=content,
+        )
+        group_meta = group.get("metadata")
+        if isinstance(group_meta, dict):
+            msg.metadata = group_meta
+        return msg
 
     async def _extract_media_message(self, message: Message) -> Message | None:
         """Extract media message from message."""
@@ -372,15 +396,40 @@ class ConsoleChannel(BaseChannel):
                 payload.get("sender_id") or "",
                 payload.get("meta"),
             )
-            content_parts = payload.get("content_parts") or []
-            should_process, merged = self._apply_no_text_debounce(
-                session_id,
-                content_parts,
-            )
-            if not should_process:
-                return
-            payload = {**payload, "content_parts": merged}
-            request = self.build_agent_request_from_native(payload)
+            message_groups = payload.get("message_groups") or []
+            if len(message_groups) > 1:
+                # Batch send: the user explicitly confirmed these messages
+                # together, so they are complete input. Skipping debounce
+                # avoids buffering an image-only batch forever.
+                request = self.build_agent_request_from_native(payload)
+            else:
+                content_parts = payload.get("content_parts") or []
+                should_process, merged = self._apply_no_text_debounce(
+                    session_id,
+                    content_parts,
+                )
+                if not should_process:
+                    return
+                # The merged view carries content buffered from earlier
+                # no-text payloads. message_groups is authoritative downstream,
+                # so it must reflect the merge or buffered parts are dropped.
+                # A native payload built without message_groups carries its
+                # metadata in message_metadata; keep that as the fallback.
+                original_group = message_groups[0] if message_groups else {}
+                group_metadata = original_group.get("metadata")
+                if group_metadata is None:
+                    group_metadata = payload.get("message_metadata")
+                payload = {
+                    **payload,
+                    "content_parts": merged,
+                    "message_groups": [
+                        {
+                            "content": merged,
+                            "metadata": group_metadata,
+                        },
+                    ],
+                }
+                request = self.build_agent_request_from_native(payload)
         else:
             request = payload
             session_id = getattr(request, "session_id", "") or ""

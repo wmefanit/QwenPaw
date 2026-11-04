@@ -17,7 +17,10 @@ import {
   extractLatestSnapshotFromCards,
 } from "../turnUsage";
 import { useTurnUsageStore } from "../turnUsageStore";
-import { extractClientMessageId } from "../../../utils/clientMessageId";
+import {
+  extractClientMessageId,
+  QWENPAW_CLIENT_MESSAGE_ID_KEY,
+} from "../../../utils/clientMessageId";
 import { useMessageQueueStore } from "../../../stores/messageQueueStore";
 import { syncSessionsGlobal } from "../../../stores/sessionListStore";
 
@@ -438,13 +441,18 @@ const resolveRealId = (
 
 const STORAGE_PREFIX = "qwenpaw_pending_user_msg_";
 
-/** Shape stored in localStorage. Backward compat: old format was plain text. */
-interface PendingUserMsg {
+/** One user message in an optimistic in-flight batch. */
+interface PendingUserMsgEntry {
   text: string;
   clientMessageId?: string;
-  /** Full content array (stored-name format) for rebuilding the user card
-   *  with attachments. When absent, only text is displayed. */
+  /** Full content array (stored-name format) for rebuilding attachments. */
   content?: Array<{ type: string; [key: string]: unknown }>;
+}
+
+/** Shape stored in localStorage. Backward compat: old format was plain text. */
+interface PendingUserMsg extends PendingUserMsgEntry {
+  /** Every unconfirmed message in a single batched SDK submission. */
+  messages?: PendingUserMsgEntry[];
 }
 
 function savePendingUserMessage(
@@ -917,21 +925,23 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
     text: string,
     content?: Array<{ type: string; [key: string]: unknown }>,
     clientMessageId?: string,
+    messages?: PendingUserMsgEntry[],
   ): void {
-    if (!text && (!content || content.length === 0)) return;
+    if (!text && (!content || content.length === 0) && !messages?.length)
+      return;
     const ids = normalizePendingUserMessageIds(sessionIds);
     for (const sessionId of ids) {
       // Callers supply only canonical Chat UUIDs and their local draft IDs.
       // A runtime session_id can belong to other users/channels or Agents;
       // it must never be used as a shared pending-message cache key.
       this.invalidateConvertedCache(sessionId);
-      if (content && content.length > 0) {
-        savePendingUserMessage(sessionId, { text, content, clientMessageId });
-      } else if (clientMessageId) {
-        savePendingUserMessage(sessionId, { text, clientMessageId });
-      } else {
-        savePendingUserMessage(sessionId, text);
-      }
+      const entry: PendingUserMsg = {
+        text,
+        ...(content?.length ? { content } : {}),
+        ...(clientMessageId ? { clientMessageId } : {}),
+        ...(messages?.length ? { messages } : {}),
+      };
+      savePendingUserMessage(sessionId, entry);
     }
   }
 
@@ -1040,7 +1050,10 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
         break;
       }
     }
-    if (!cached || (!cached.text && !cached.content?.length)) {
+    if (
+      !cached ||
+      (!cached.text && !cached.content?.length && !cached.messages?.length)
+    ) {
       if (!generating) {
         pendingIds.forEach(clearPendingUserMessage);
       }
@@ -1053,29 +1066,41 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
       savePendingUserMessage(canonicalId, cached);
     }
 
-    // A request is confirmed as soon as its unique client id appears
-    // anywhere in history. This also prevents an already-persisted turn from
-    // being appended again while the backend still reports "running".
-    if (cached.clientMessageId) {
-      const persistenceConfirmed = messages.some((message) => {
-        if (message.role !== ROLE_USER) return false;
-        const input = message?.cards?.[0]?.data?.input?.[0];
-        return (
-          extractClientMessageId(input?.metadata) === cached.clientMessageId
-        );
-      });
-      if (persistenceConfirmed) {
-        pendingIds.forEach(clearPendingUserMessage);
-        return false;
+    const pendingEntries: PendingUserMsgEntry[] = cached.messages?.length
+      ? cached.messages
+      : [
+          {
+            text: cached.text,
+            ...(cached.clientMessageId
+              ? { clientMessageId: cached.clientMessageId }
+              : {}),
+            ...(cached.content ? { content: cached.content } : {}),
+          },
+        ];
+    const persistedIds = new Set<string>();
+    for (const message of messages) {
+      if (message.role !== ROLE_USER) continue;
+      const inputs = message?.cards?.[0]?.data?.input;
+      if (!Array.isArray(inputs)) continue;
+      for (const input of inputs) {
+        const id = extractClientMessageId(input?.metadata);
+        if (id) persistedIds.add(id);
       }
     }
 
-    // When the chat is idle, clear the cache only after the fetched
-    // history actually contains the pending text. Clearing
-    // unconditionally lost the last message in two windows: POST sent
-    // but the run not registered yet (status still "idle"), and
-    // generation completed but the memory flush not finished.
-    if (!generating) {
+    // Keep only messages not yet confirmed in backend history. A batch may be
+    // partially persisted when the run is interrupted or history is fetched
+    // while the backend is still flushing messages.
+    const missingEntries = pendingEntries.filter(
+      (entry) =>
+        !entry.clientMessageId || !persistedIds.has(entry.clientMessageId),
+    );
+    if (missingEntries.length === 0) {
+      pendingIds.forEach(clearPendingUserMessage);
+      return false;
+    }
+
+    if (!generating && !cached.messages) {
       let lastUserText = "";
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i].role !== ROLE_USER) continue;
@@ -1083,40 +1108,109 @@ class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
         lastUserText = extractTextFromContent(input?.content);
         break;
       }
-      const persistenceConfirmed =
+      const legacyTextPersisted =
         !cached.clientMessageId && lastUserText.trim() === cached.text.trim();
-      if (persistenceConfirmed) {
+      if (legacyTextPersisted) {
         pendingIds.forEach(clearPendingUserMessage);
         return false;
       }
-      // History is missing the turn — fall through and patch it in,
-      // keeping the cache until a later fetch confirms persistence.
     }
 
-    // Use the full content array (with images/files) when available;
-    // fall back to text-only for legacy entries.
-    const msgContent: unknown =
-      cached.content ??
-      (cached.text ? [{ type: "text", text: cached.text }] : []);
-
-    const lastMsg = messages[messages.length - 1];
-    if (lastMsg?.role === ROLE_USER) {
-      const text = extractTextFromContent(
-        lastMsg?.cards?.[0]?.data?.input?.[0]?.content,
+    const batchIds = new Set(
+      pendingEntries
+        .map((entry) => entry.clientMessageId)
+        .filter((id): id is string => Boolean(id)),
+    );
+    const persistedInputs = new Map<string, Record<string, unknown>>();
+    let firstBatchMessageIndex = -1;
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index];
+      if (message.role !== ROLE_USER) continue;
+      const card = message.cards?.find(
+        (entry) => entry.code === "AgentScopeRuntimeRequestCard",
       );
-      if (!text) {
-        lastMsg.cards = buildUserCard({
-          content: msgContent,
-          role: ROLE_USER,
-        } as Message).cards;
+      const inputs = card?.data?.input;
+      if (!Array.isArray(inputs)) continue;
+      for (const input of inputs as Array<Record<string, unknown>>) {
+        const id = extractClientMessageId(input.metadata);
+        if (!id || !batchIds.has(id)) continue;
+        if (firstBatchMessageIndex < 0) firstBatchMessageIndex = index;
+        persistedInputs.set(id, input);
+      }
+    }
+
+    // Rebuild the full batch in queue order at the first persisted batch
+    // message. This keeps missing items before any assistant output and avoids
+    // duplicates when history contains only part of the batch.
+    const batchInputs = pendingEntries.map((entry) => {
+      if (entry.clientMessageId) {
+        const persisted = persistedInputs.get(entry.clientMessageId);
+        if (persisted) return persisted;
+      }
+      return {
+        role: ROLE_USER,
+        type: "message",
+        content: contentToRequestParts(
+          entry.content ??
+            (entry.text ? [{ type: "text", text: entry.text }] : []),
+        ),
+        metadata: entry.clientMessageId
+          ? { [QWENPAW_CLIENT_MESSAGE_ID_KEY]: entry.clientMessageId }
+          : null,
+      };
+    });
+
+    if (firstBatchMessageIndex >= 0) {
+      const firstMessage = messages[firstBatchMessageIndex];
+      const firstCard = firstMessage.cards?.find(
+        (entry) => entry.code === "AgentScopeRuntimeRequestCard",
+      );
+      if (!firstCard?.data || !Array.isArray(firstCard.data.input))
+        return false;
+      const firstInputs = firstCard.data.input as Array<
+        Record<string, unknown>
+      >;
+      const nonBatchInputs = firstInputs.filter((input) => {
+        const id = extractClientMessageId(input.metadata);
+        return !id || !batchIds.has(id);
+      });
+      firstCard.data.input = [...nonBatchInputs, ...batchInputs];
+
+      // Remove duplicate persisted batch messages from their old cards while
+      // retaining any unrelated input records they may contain.
+      for (
+        let index = messages.length - 1;
+        index > firstBatchMessageIndex;
+        index -= 1
+      ) {
+        const message = messages[index];
+        if (message.role !== ROLE_USER) continue;
+        const card = message.cards?.find(
+          (entry) => entry.code === "AgentScopeRuntimeRequestCard",
+        );
+        const inputs = card?.data?.input;
+        if (!Array.isArray(inputs)) continue;
+        const remaining = (inputs as Array<Record<string, unknown>>).filter(
+          (input) => {
+            const id = extractClientMessageId(input.metadata);
+            return !id || !batchIds.has(id);
+          },
+        );
+        if (remaining.length === inputs.length) continue;
+        if (remaining.length) card.data.input = remaining;
+        else messages.splice(index, 1);
       }
     } else {
-      messages.push(
-        buildUserCard({
-          content: msgContent,
-          role: ROLE_USER,
-        } as Message),
-      );
+      messages.push({
+        id: generateId(),
+        role: ROLE_USER,
+        cards: [
+          {
+            code: "AgentScopeRuntimeRequestCard",
+            data: { input: batchInputs },
+          },
+        ],
+      } as IAgentScopeRuntimeWebUIMessage);
     }
     return true;
   }

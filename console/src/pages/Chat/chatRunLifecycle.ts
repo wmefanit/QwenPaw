@@ -99,21 +99,39 @@ export async function recoverSendingQueueHead(
   queueKey: string,
   errorMessage: string,
 ): Promise<void> {
-  const head = useMessageQueueStore.getState().getQueue(queueKey)[0];
-  if (head?.status !== "sending") return;
+  const initialQueue = useMessageQueueStore.getState().getQueue(queueKey);
+  const firstNonSendingIndex = initialQueue.findIndex(
+    (item) => item.status !== "sending",
+  );
+  const sendingBatch = initialQueue.slice(
+    0,
+    firstNonSendingIndex < 0 ? initialQueue.length : firstNonSendingIndex,
+  );
+  const head = sendingBatch[0];
+  if (!head) return;
   try {
     if (!(await waitForChatIdle(chatId, signal, agentId, queueKey))) return;
   } catch (error) {
     if (signal.aborted) return;
     if (error instanceof Error) errorMessage = error.message;
   }
-  const store = useMessageQueueStore.getState();
-  const current = store.getQueue(queueKey).find((item) => item.id === head.id);
-  if (
-    !signal.aborted &&
-    store.getRunState(queueKey) !== "paused" &&
-    current?.status === "sending"
-  ) {
-    store.setItemStatus(queueKey, head.id, "failed", errorMessage);
+  const state = useMessageQueueStore.getState();
+  if (signal.aborted || state.getRunState(queueKey) === "paused") return;
+
+  // waitForChatIdle reconciles persisted receipts and removes confirmed items.
+  // Any contiguous sending items still present have unknown receipts and must
+  // become explicitly retryable instead of remaining stuck behind the head.
+  for (const sentItem of sendingBatch) {
+    const current = useMessageQueueStore
+      .getState()
+      .getQueue(queueKey)
+      .find((item) => item.id === sentItem.id);
+    if (current?.status !== "sending") continue;
+    useMessageQueueStore
+      .getState()
+      .setItemStatus(queueKey, sentItem.id, "failed", errorMessage);
+  }
+  if (sendingBatch.some((item) => item.id === state.currentSendingId)) {
+    useMessageQueueStore.getState().setCurrentSendingId(null);
   }
 }

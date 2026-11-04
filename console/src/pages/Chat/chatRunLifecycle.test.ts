@@ -421,8 +421,10 @@ describe("persisted sending recovery", () => {
       expect.objectContaining({ headers: { "X-Agent-Id": "agent-a" } }),
     );
   });
-  it("makes an unknown receipt explicitly retryable instead of silently resending", async () => {
-    sendingHead();
+  it("makes every unknown member of a persisted batch explicitly retryable", async () => {
+    const head = sendingHead();
+    const second = useMessageQueueStore.getState().getQueue(key)[1];
+    useMessageQueueStore.getState().setItemStatus(key, second.id, "sending");
     vi.mocked(request).mockResolvedValue({ status: "idle", messages: [] });
     await recoverSendingQueueHead(
       key,
@@ -431,12 +433,38 @@ describe("persisted sending recovery", () => {
       key,
       "retry required",
     );
-    expect(useMessageQueueStore.getState().getQueue(key)[0]).toMatchObject({
-      status: "failed",
-      errorMessage: "retry required",
-    });
+    expect(useMessageQueueStore.getState().getQueue(key)).toMatchObject([
+      { id: head.id, status: "failed", errorMessage: "retry required" },
+      { id: second.id, status: "failed", errorMessage: "retry required" },
+    ]);
     expect(useMessageQueueStore.getState().getRunState(key)).toBe("error");
-    expect(useMessageQueueStore.getState().getQueue(key)).toHaveLength(2);
+  });
+
+  it("reconciles confirmed batch members and only fails missing receipts", async () => {
+    const head = sendingHead();
+    const second = useMessageQueueStore.getState().getQueue(key)[1];
+    useMessageQueueStore.getState().setItemStatus(key, second.id, "sending");
+    vi.mocked(request).mockResolvedValue({
+      status: "idle",
+      messages: [
+        {
+          role: "user",
+          metadata: { qwenpaw_client_message_id: head.clientMessageId },
+        },
+      ],
+    });
+
+    await recoverSendingQueueHead(
+      key,
+      new AbortController().signal,
+      "agent-a",
+      key,
+      "retry required",
+    );
+
+    expect(useMessageQueueStore.getState().getQueue(key)).toMatchObject([
+      { id: second.id, status: "failed", errorMessage: "retry required" },
+    ]);
   });
   it("does not mutate a sending item after another Agent switch during recovery", async () => {
     sendingHead();

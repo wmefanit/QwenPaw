@@ -1921,6 +1921,18 @@ describe("ChatPage coverage", () => {
         }),
       ]),
       expect.any(String),
+      [
+        expect.objectContaining({
+          text: "",
+          clientMessageId: expect.any(String),
+          content: expect.arrayContaining([
+            expect.objectContaining({
+              type: "file",
+              file_url: "report.pdf",
+            }),
+          ]),
+        }),
+      ],
     );
   });
 

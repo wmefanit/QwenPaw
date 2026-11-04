@@ -132,7 +132,11 @@ import {
   recoverSendingQueueHead,
   waitForChatIdle,
 } from "./chatRunLifecycle";
-import { applyChatPayloadTransforms } from "./chatPayload";
+import {
+  applyChatPayloadTransforms,
+  BATCH_INPUT_KEY,
+  expandBatchInput,
+} from "./chatPayload";
 import { createSdkSessionAdapter } from "./sdkSessionAdapter";
 import { migrateChatSessionPreferences } from "./chatSessionPreferences";
 import {
@@ -281,6 +285,7 @@ import {
   withBackgroundSendLock,
   holdOwnershipLock,
 } from "../../stores/messageQueueStore";
+import { selectBatchItems } from "../../stores/batchSelection";
 import {
   requiresQwenPawModel,
   supportsAgentAttachments,
@@ -1605,6 +1610,8 @@ export default function ChatPage() {
           : undefined);
       const userId = item.userId || DEFAULT_USER_ID;
       const channel = item.channel || DEFAULT_CHANNEL;
+      // Populated once the batch is known; success/failure apply to the batch.
+      let batchItems: QueueItem[] = [item];
 
       try {
         // SDK loading is local connection state. Stop/disconnect can clear it
@@ -1655,18 +1662,40 @@ export default function ChatPage() {
         )
           return false;
         item = freshItem;
+        // Batch the contiguous compatible text items. Attachments, mentions,
+        // quotes and request-context boundaries are sent as separate turns.
+        batchItems = selectBatchItems(
+          store.getQueue(freshQueueId),
+          item,
+          agentId,
+        );
         store.setCurrentSendingId(item.id);
-        store.setItemStatus(freshQueueId, item.id, "sending");
+        for (const entry of batchItems) {
+          store.setItemStatus(freshQueueId, entry.id, "sending");
+        }
+        const preparedQuery = beginLoopModeSubmission(item.text);
         const accepted = await awaitQueueAcceptance(
           execution.execute(
             {
-              query: beginLoopModeSubmission(item.text),
+              query: preparedQuery,
               fileList: buildFileList(item),
               session_id: runtimeSessionId,
               user_id: userId,
               channel,
               agent_id: agentId,
-              biz_params: item.bizParams,
+              biz_params:
+                batchItems.length > 1
+                  ? {
+                      ...item.bizParams,
+                      qwenpaw_batch_input: batchItems.map((entry) => ({
+                        // The leading submission text already carries the
+                        // loop-mode transformation; pack that result so
+                        // expansion does not silently undo it.
+                        text: entry.id === item.id ? preparedQuery : entry.text,
+                        clientMessageId: entry.clientMessageId ?? entry.id,
+                      })),
+                    }
+                  : item.bizParams,
               context: buildChatSubmissionContext(
                 item.requestContext,
                 { sessionId: runtimeSessionId, userId, channel },
@@ -1685,22 +1714,26 @@ export default function ChatPage() {
         const currentQueueId = locateQueue();
         if (accepted.accepted) {
           if (currentQueueId) {
-            useMessageQueueStore.getState().remove(currentQueueId, item.id);
+            const queueStore = useMessageQueueStore.getState();
+            for (const entry of batchItems) {
+              queueStore.remove(currentQueueId, entry.id);
+            }
           }
           return true;
         }
 
         if (currentQueueId) {
-          useMessageQueueStore
-            .getState()
-            .setItemStatus(
+          const queueStore = useMessageQueueStore.getState();
+          for (const entry of batchItems) {
+            queueStore.setItemStatus(
               currentQueueId,
-              item.id,
+              entry.id,
               "failed",
               accepted.error instanceof Error
                 ? accepted.error.message
                 : i18n.t("chat.queue.sendFailed"),
             );
+          }
         }
       } catch (error) {
         // The old SDK Run may stay disconnected indefinitely after switching
@@ -1709,16 +1742,17 @@ export default function ChatPage() {
         if (signal.aborted) return false;
         const currentQueueId = locateQueue();
         if (currentQueueId) {
-          useMessageQueueStore
-            .getState()
-            .setItemStatus(
+          const queueStore = useMessageQueueStore.getState();
+          for (const entry of batchItems) {
+            queueStore.setItemStatus(
               currentQueueId,
-              item.id,
+              entry.id,
               "failed",
               error instanceof Error
                 ? error.message
                 : i18n.t("chat.queue.sendFailed"),
             );
+          }
         }
       } finally {
         const store = useMessageQueueStore.getState();
@@ -3309,8 +3343,19 @@ export default function ChatPage() {
           ? [rewrittenLastMsg]
           : [];
 
-      // Keep the receipt identity on the SDK's visible user card as well as
-      // the wire request. Regenerate targets this identity, never text.
+      // Batch send: the SDK accepts a single query string, so the queue packs
+      // the whole batch into biz_params. Expand it back into independent user
+      // messages and drop the private key before it reaches the backend.
+      const expanded = expandBatchInput(
+        rewrittenInput,
+        biz_params as Record<string, unknown> | undefined,
+      );
+      const finalInput = expanded.input;
+      const cleanBizParams = expanded.bizParams;
+
+      // Keep the SDK's optimistic user card aligned with the expanded wire
+      // input. A batch is one SDK submission but several backend user messages;
+      // render/cache every message with its own receipt identity.
       if (clientMessageId && fallbackLocalChatId) {
         const api = chatRef.current?.messages;
         const users = api
@@ -3318,6 +3363,14 @@ export default function ChatPage() {
           .filter((entry) => entry.role === "user");
         const user = users?.[users.length - 1];
         if (api && user) {
+          const displayInputs = finalInput
+            .filter((entry) => entry.role === "user")
+            .map((entry) => ({
+              ...entry,
+              content: Array.isArray(entry.content)
+                ? entry.content.map((part) => ({ status: "created", ...part }))
+                : entry.content,
+            }));
           api.updateMessage(
             {
               ...user,
@@ -3325,13 +3378,7 @@ export default function ChatPage() {
                 card.code === "AgentScopeRuntimeRequestCard"
                   ? {
                       ...card,
-                      data: {
-                        ...card.data,
-                        input: card.data.input.map(
-                          (entry: Record<string, unknown>) =>
-                            attachClientMessageId(entry, clientMessageId),
-                        ),
-                      },
+                      data: { ...card.data, input: displayInputs },
                     }
                   : card,
               ),
@@ -3351,7 +3398,7 @@ export default function ChatPage() {
         .getState()
         .beginTurn(requestSnapshot.agentId, requestSnapshot.sessionId);
       let requestBody: Record<string, unknown> = {
-        input: rewrittenInput,
+        input: finalInput,
         session_id: requestSnapshot.sessionId,
         user_id: requestSnapshot.userId || DEFAULT_USER_ID,
         channel: requestSnapshot.channel || DEFAULT_CHANNEL,
@@ -3359,18 +3406,37 @@ export default function ChatPage() {
         ...(Object.keys(requestSnapshot.context).length > 0
           ? { request_context: requestSnapshot.context }
           : {}),
-        ...biz_params,
+        ...cleanBizParams,
       };
 
+      const finalUserInputs = finalInput.filter(
+        (entry) => entry.role === "user",
+      );
       requestBody = applyChatPayloadTransforms(
         requestBody,
         requestSnapshot.agentId,
-        clientMessageId,
+        // A batch already stamped every message with its own receipt id, and
+        // this helper only rewrites the last user message. Passing the batch's
+        // first id here would overwrite the last entry.
+        finalInput.length > 1 ? undefined : clientMessageId,
         extLists[ChatList.requestPayloadTransforms],
         usesQwenPawBackend
           ? { approval_level: approvalAtSubmission }
           : { backend_controls: controlsAtSubmission },
+        finalUserInputs.length > 1
+          ? finalUserInputs.map((entry) => {
+              const metadata = entry.metadata as
+                | Record<string, unknown>
+                | undefined;
+              return String(metadata?.[QWENPAW_CLIENT_MESSAGE_ID_KEY] || "");
+            })
+          : undefined,
       );
+      if (BATCH_INPUT_KEY in requestBody) {
+        const { [BATCH_INPUT_KEY]: _batchInput, ...publicRequest } =
+          requestBody;
+        requestBody = publicRequest;
+      }
       let projectSessionId: string | null = null;
       let appliedProjectDir: string | null = null;
 
@@ -3391,29 +3457,43 @@ export default function ChatPage() {
         sessionApi.getRealIdForSession(submittedChatId) ?? submittedChatId;
       const pendingSessionIds = [backendChatId, submittedChatId];
       if (backendChatId) {
-        const userMessages = rewrittenInput.filter((m) => m.role === "user");
+        const userMessages = finalInput.filter((m) => m.role === "user");
         const userText = userMessages
           .map(extractUserMessageText)
           .join("\n")
           .trim();
-        const lastUserMsg = userMessages.slice(-1)[0];
-        const contentArr = Array.isArray(lastUserMsg?.content)
-          ? (lastUserMsg.content as Array<{
-              type: string;
-              [key: string]: unknown;
-            }>)
-          : undefined;
-        const hasAttachmentContent = contentArr?.some(
-          (item) => item.type !== "text",
+        const pendingMessages = userMessages.map((message) => ({
+          text: extractUserMessageText(message),
+          clientMessageId:
+            typeof message.metadata === "object" && message.metadata !== null
+              ? String(
+                  (message.metadata as Record<string, unknown>)[
+                    QWENPAW_CLIENT_MESSAGE_ID_KEY
+                  ] || "",
+                )
+              : undefined,
+          content: Array.isArray(message.content)
+            ? (message.content as Array<{
+                type: string;
+                [key: string]: unknown;
+              }>)
+            : undefined,
+        }));
+        const hasPendingContent = pendingMessages.some(
+          (message) =>
+            message.text ||
+            message.content?.some((part) => part.type !== "text"),
         );
-        if (userText || hasAttachmentContent) {
-          // Cache full content so attachment-only messages survive refresh,
-          // reconnect, and the backend history flush window.
+        if (hasPendingContent) {
+          // Cache every batch entry so refresh/reconnect can restore each
+          // message independently and reconcile its own receipt identity.
+          const lastMessage = pendingMessages[pendingMessages.length - 1];
           sessionApi.setLastUserMessage(
             pendingSessionIds,
             userText,
-            contentArr,
+            lastMessage?.content,
             clientMessageId,
+            pendingMessages,
           );
         }
       }

@@ -280,22 +280,36 @@ def _extract_session_and_payload(request_data: Union[AgentRequest, dict]):
         channel_id = getattr(request_data, "channel", None) or "console"
         sender_id = request_data.user_id or "default"
         session_id = request_data.session_id or "default"
-        content_parts = (
-            list(request_data.input[0].content) if request_data.input else []
-        )
-        message_metadata = (
-            request_data.input[0].metadata if request_data.input else None
-        )
+        message_groups: list[dict] = []
+        content_parts = []
+        message_metadata = None
+        if request_data.input:
+            for msg in request_data.input:
+                group = list(msg.content or [])
+                message_groups.append(
+                    {
+                        "content": group,
+                        "metadata": getattr(msg, "metadata", None),
+                    },
+                )
+                content_parts.extend(group)
+            message_metadata = request_data.input[0].metadata
     else:
         channel_id = request_data.get("channel", "console")
         sender_id = request_data.get("user_id", "default")
         session_id = request_data.get("session_id", "default")
         input_data = request_data.get("input", [])
+        message_groups = []
         content_parts = []
         message_metadata = None
         for content_part in input_data:
             if hasattr(content_part, "content"):
-                content_parts.extend(list(content_part.content or []))
+                group = list(content_part.content or [])
+                group_meta = getattr(content_part, "metadata", None)
+                message_groups.append(
+                    {"content": group, "metadata": group_meta},
+                )
+                content_parts.extend(group)
                 message_metadata = getattr(
                     content_part,
                     "metadata",
@@ -304,10 +318,15 @@ def _extract_session_and_payload(request_data: Union[AgentRequest, dict]):
             elif isinstance(content_part, dict) and "content" in content_part:
                 # Coerce raw dicts to typed Content models so downstream
                 # getattr checks (e.g. _content_has_text) see real attrs.
-                content_parts.extend(
+                group = [
                     _coerce_content_item(c)
                     for c in (content_part["content"] or [])
+                ]
+                group_meta = content_part.get("metadata")
+                message_groups.append(
+                    {"content": group, "metadata": group_meta},
                 )
+                content_parts.extend(group)
                 if isinstance(content_part.get("metadata"), dict):
                     message_metadata = content_part["metadata"]
 
@@ -328,6 +347,7 @@ def _extract_session_and_payload(request_data: Union[AgentRequest, dict]):
         "channel_id": channel_id,
         "sender_id": sender_id,
         "content_parts": content_parts,
+        "message_groups": message_groups,
         "message_metadata": message_metadata,
         "meta": meta,
     }
