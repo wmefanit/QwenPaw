@@ -11,12 +11,31 @@ import {
   expandBatchInput,
 } from "./chatPayload";
 import { QWENPAW_CLIENT_MESSAGE_ID_KEY } from "../../utils/clientMessageId";
+import type { ChatRequestPayloadTransformItem } from "../../plugins/registry/types";
 
 const template = {
   role: "user",
   content: [{ type: "text", text: "first" }],
   metadata: { existing: "kept" },
 };
+
+type TransformEntries = NonNullable<
+  Parameters<typeof applyChatPayloadTransforms>[3]
+>;
+
+function testTransform(
+  id: string,
+  transform: ChatRequestPayloadTransformItem["transform"],
+): TransformEntries {
+  return [
+    {
+      registrationId: `test-plugin:${id}`,
+      pluginId: "test-plugin",
+      registeredAt: 0,
+      item: { id, transform },
+    },
+  ];
+}
 
 function receiptId(message: Record<string, unknown>): string | undefined {
   const metadata = message.metadata as Record<string, unknown> | undefined;
@@ -37,23 +56,14 @@ describe("applyChatPayloadTransforms batch receipt IDs", () => {
         },
         "agent-a",
         undefined,
-        [
-          {
-            pluginId: "test-plugin",
-            registeredAt: 0,
-            item: {
-              id: "drop-input",
-              transform: ({ payload }) => ({
-                ...payload,
-                input: [payload.input![0]],
-              }),
-            },
-          },
-        ] as never,
+        testTransform("drop-input", ({ payload }) => ({
+          ...payload,
+          input: (payload.input as unknown[])[0],
+        })),
         undefined,
         ["id-a", "id-b"],
       ),
-    ).toThrow(/changed the number of queued batch messages/);
+    ).toThrow(/removed queued batch messages/);
   });
 
   it("restores each receipt id after a transform replaces user input objects", () => {
@@ -68,23 +78,14 @@ describe("applyChatPayloadTransforms batch receipt IDs", () => {
       },
       "agent-a",
       undefined,
-      [
-        {
-          pluginId: "test-plugin",
-          registeredAt: 0,
-          item: {
-            id: "replace-input",
-            transform: ({ payload }) => ({
-              ...payload,
-              input: [
-                { role: "user", content: [{ type: "text", text: "alpha" }] },
-                { role: "assistant", content: [] },
-                { role: "user", content: [{ type: "text", text: "beta" }] },
-              ],
-            }),
-          },
-        },
-      ] as never,
+      testTransform("replace-input", ({ payload }) => ({
+        ...payload,
+        input: [
+          { role: "user", content: [{ type: "text", text: "alpha" }] },
+          { role: "assistant", content: [] },
+          { role: "user", content: [{ type: "text", text: "beta" }] },
+        ],
+      })),
       undefined,
       ["id-a", "id-b"],
     );
