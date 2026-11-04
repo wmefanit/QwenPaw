@@ -244,6 +244,122 @@ describe("createSession owner-epoch singleflight", () => {
   });
 });
 
+describe("pending batched user-message recovery", () => {
+  const chatId = "99999999-9999-4999-8999-999999999999";
+
+  beforeEach(() => {
+    sessionApi.resetForTests();
+    sessionApi.setActiveAgent("A");
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    sessionApi.resetForTests();
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+
+  it("restores every pending batch entry with its distinct receipt id", async () => {
+    const firstId = "batch-message-1";
+    const secondId = "batch-message-2";
+    sessionApi.setLastUserMessage(
+      chatId,
+      "alpha\\nbeta",
+      [{ type: "text", text: "beta" }],
+      firstId,
+      [
+        {
+          text: "alpha",
+          clientMessageId: firstId,
+          content: [{ type: "text", text: "alpha" }],
+        },
+        {
+          text: "beta",
+          clientMessageId: secondId,
+          content: [{ type: "text", text: "beta" }],
+        },
+      ],
+    );
+    vi.spyOn(api, "getChat").mockResolvedValue({
+      messages: [],
+      status: "running",
+    } as ChatHistory);
+
+    const session = await sessionApi.getSession(chatId);
+    const restored = session.messages
+      .filter((message) => message.role === "user")
+      .flatMap((message) => message.cards?.[0]?.data?.input ?? []);
+
+    expect(restored).toHaveLength(2);
+    expect(restored.map((entry) => entry.content[0].text)).toEqual([
+      "alpha",
+      "beta",
+    ]);
+    expect(restored.map((entry) => entry.metadata)).toEqual([
+      { qwenpaw_client_message_id: firstId },
+      { qwenpaw_client_message_id: secondId },
+    ]);
+  });
+
+  it("restores only missing entries before assistant output and keeps queue order", async () => {
+    const firstId = "batch-message-1";
+    const secondId = "batch-message-2";
+    sessionApi.setLastUserMessage(
+      chatId,
+      "alpha\\nbeta",
+      [{ type: "text", text: "beta" }],
+      firstId,
+      [
+        {
+          text: "alpha",
+          clientMessageId: firstId,
+          content: [{ type: "text", text: "alpha" }],
+        },
+        {
+          text: "beta",
+          clientMessageId: secondId,
+          content: [{ type: "text", text: "beta" }],
+        },
+      ],
+    );
+    vi.spyOn(api, "getChat").mockResolvedValue({
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "alpha" }],
+          metadata: { qwenpaw_client_message_id: firstId },
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "reply" }],
+          metadata: { timestamp: "2026-01-01 00:00:00" },
+        },
+      ],
+      status: "running",
+    } as ChatHistory);
+
+    const session = await sessionApi.getSession(chatId);
+    const userMessage = session.messages.find(
+      (message) => message.role === "user",
+    );
+    const restored = userMessage?.cards?.[0]?.data?.input ?? [];
+
+    expect(session.messages[0].role).toBe("user");
+    expect(session.messages[1].role).toBe("assistant");
+    expect(restored).toHaveLength(2);
+    expect(restored.map((entry) => entry.content[0].text)).toEqual([
+      "alpha",
+      "beta",
+    ]);
+    expect(restored.map((entry) => entry.metadata)).toEqual([
+      { qwenpaw_client_message_id: firstId },
+      { qwenpaw_client_message_id: secondId },
+    ]);
+  });
+});
+
 describe("bound session history owner epochs", () => {
   beforeEach(() => {
     sessionApi.resetForTests();
