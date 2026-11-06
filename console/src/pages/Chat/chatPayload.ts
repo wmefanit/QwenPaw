@@ -8,6 +8,8 @@ export const BATCH_INPUT_KEY = "qwenpaw_batch_input";
 export interface BatchEntry {
   text: string;
   clientMessageId: string;
+  content?: Array<Record<string, unknown>>;
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -28,15 +30,23 @@ export function expandBatchInput(
   const raw = bizParams?.[BATCH_INPUT_KEY];
   const entries = Array.isArray(raw) ? (raw as BatchEntry[]) : null;
   const template = input[0];
-  if (!entries || entries.length <= 1 || !template) {
+  if (!entries || entries.length === 0 || !template) {
     return { input, bizParams };
   }
-  const expanded = entries.map((entry) =>
-    attachClientMessageId(
-      { ...template, content: [{ type: "text", text: entry.text }] },
-      entry.clientMessageId,
-    ),
-  );
+  const expanded = entries.map((entry) => {
+    const templateMetadata =
+      typeof template.metadata === "object" && template.metadata !== null
+        ? (template.metadata as Record<string, unknown>)
+        : {};
+    const message = {
+      ...template,
+      ...(entry.metadata
+        ? { metadata: { ...templateMetadata, ...entry.metadata } }
+        : {}),
+      content: entry.content ?? [{ type: "text", text: entry.text }],
+    };
+    return attachClientMessageId(message, entry.clientMessageId);
+  });
   const cleaned = bizParams
     ? Object.fromEntries(
         Object.entries(bizParams).filter(([key]) => key !== BATCH_INPUT_KEY),

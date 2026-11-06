@@ -1,9 +1,10 @@
 /**
  * Batch send selection: which queued messages may travel in one turn.
  *
- * The SDK exposes one query and one file list per submission, so only
- * contiguous plain-text messages with identical routing and request semantics
- * can be batched. The first incompatible queue item is a hard boundary.
+ * Each entry is serialized as its own content group, so media, mentions, and
+ * quotes remain independent instead of being flattened into the first SDK
+ * query/file list. The first incompatible routing/context item is a hard FIFO
+ * boundary.
  */
 import type { QueueItem } from "./messageQueueStore";
 
@@ -22,14 +23,9 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value) ?? String(value);
 }
 
-/** A queued item can join a batch only when it carries nothing but text. */
-export function isBatchable(item: QueueItem): boolean {
-  return (
-    !item.attachments?.length &&
-    !item.images?.length &&
-    !item.mentions?.length &&
-    !item.quote
-  );
+/** Every queued item has an independently serializable message group. */
+export function isBatchable(_item: QueueItem): boolean {
+  return true;
 }
 
 function hasSameRequestSemantics(
@@ -59,6 +55,7 @@ export function selectBatchItems(
   queue: QueueItem[],
   item: QueueItem,
   agentId: string,
+  quantity: "one" | "all" = "all",
 ): QueueItem[] {
   if (item.status !== "pending" || !isBatchable(item)) return [item];
 
@@ -66,6 +63,7 @@ export function selectBatchItems(
   if (start !== 0) return [item];
 
   const batch = [queue[start]];
+  if (quantity === "one") return batch;
   for (let index = start + 1; index < queue.length; index += 1) {
     const candidate = queue[index];
     if (

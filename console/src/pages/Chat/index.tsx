@@ -286,6 +286,7 @@ import {
   holdOwnershipLock,
 } from "../../stores/messageQueueStore";
 import { selectBatchItems } from "../../stores/batchSelection";
+import { submitQueueSteering } from "./queueSteering";
 import {
   requiresQwenPawModel,
   supportsAgentAttachments,
@@ -302,7 +303,12 @@ import {
  * expected by the backend POST body and by patchLastUserMessage.
  */
 function buildAttachmentContentItems(
-  attachments: Array<{ url: string; name?: string; type?: string }> | undefined,
+  attachments: Array<{
+    url: string;
+    name?: string;
+    type?: string;
+    size?: number;
+  }> | undefined,
 ): Array<{ type: string; [key: string]: unknown }> {
   if (!attachments || attachments.length === 0) return [];
   return attachments.map((a) => {
@@ -316,8 +322,78 @@ function buildAttachmentContentItems(
     if (a.type?.startsWith("audio/")) {
       return { type: "audio", data: storedUrl };
     }
-    return { type: "file", file_url: storedUrl, file_name: a.name || "file" };
+    return {
+      type: "file",
+      file_url: storedUrl,
+      file_name: a.name || "file",
+      ...(a.size != null ? { file_size: a.size } : {}),
+    };
   });
+}
+
+function buildQueueItemContent(item: QueueItem): Array<{
+  type: string;
+  [key: string]: unknown;
+}> {
+  return [
+    ...(item.text ? [{ type: "text", text: item.text }] : []),
+    ...buildAttachmentContentItems([
+      ...(item.attachments || []),
+      ...(item.images || []).map((image) => ({
+        url: image.url,
+        name: image.name,
+        type: "image/unknown",
+      })),
+    ]),
+  ];
+}
+
+function buildQueueItemGroups(item: QueueItem) {
+  if (item.messageGroups?.length) {
+    return item.messageGroups.map((group) => ({
+      role: "user",
+      metadata: {
+        ...(group.metadata || {}),
+        [QWENPAW_CLIENT_MESSAGE_ID_KEY]:
+          group.clientMessageId || item.clientMessageId || item.id,
+      },
+      content: group.content ?? [{ type: "text", text: group.text }],
+    }));
+  }
+  return [
+    {
+      role: "user",
+      metadata: {
+        ...buildQueueItemMetadata(item),
+        [QWENPAW_CLIENT_MESSAGE_ID_KEY]: item.clientMessageId ?? item.id,
+      },
+      content: buildQueueItemContent(item),
+    },
+  ];
+}
+
+function buildQueueBatchGroups(items: QueueItem[], preparedText?: string) {
+  const groups = items.flatMap(buildQueueItemGroups);
+  if (!preparedText) return groups;
+  const firstTextGroup = groups.find((group) =>
+    group.content.some((part) => part.type === "text"),
+  );
+  if (firstTextGroup) {
+    let replaced = false;
+    firstTextGroup.content = firstTextGroup.content.map((part) => {
+      if (replaced || part.type !== "text") return part;
+      replaced = true;
+      return { ...part, text: preparedText };
+    });
+  }
+  return groups;
+}
+
+function buildQueueItemMetadata(item: QueueItem): Record<string, unknown> {
+  return {
+    ...(item.mentions?.length ? { mentions: item.mentions } : {}),
+    ...(item.quote ? { quote: item.quote } : {}),
+  };
 }
 
 /**
@@ -412,6 +488,61 @@ async function startBackgroundQueue(
         const waitingItem = current[0];
         if (!["pending", "sending"].includes(waitingItem.status)) return false;
 
+        const sendOptions = useMessageQueueStore
+          .getState()
+          .getSendOptions(queueKey);
+        if (
+          sendOptions.timing === "before_next_request" &&
+          waitingItem.status === "pending" &&
+          chatIdForStatus
+        ) {
+          const steeringBatch = selectBatchItems(
+            current,
+            waitingItem,
+            waitingItem.agentId || "default",
+            sendOptions.quantity,
+          );
+          const steeringMessages = buildQueueBatchGroups(steeringBatch);
+          for (const entry of steeringBatch) {
+            useMessageQueueStore
+              .getState()
+              .setItemStatus(queueKey, entry.id, "sending");
+          }
+          try {
+            const result = await submitQueueSteering(
+              chatIdForStatus,
+              waitingItem.agentId || "default",
+              steeringMessages,
+              ctrl.signal,
+            );
+            if (result === "accepted") {
+              // Keep local receipts in `sending` until backend history
+              // confirms injection; recovery will reconcile after run idle.
+              return true;
+            }
+            for (const entry of steeringBatch) {
+              useMessageQueueStore
+                .getState()
+                .setItemStatus(queueKey, entry.id, "pending");
+            }
+          } catch (error) {
+            if (ctrl.signal.aborted) return false;
+            for (const entry of steeringBatch) {
+              useMessageQueueStore
+                .getState()
+                .setItemStatus(
+                  queueKey,
+                  entry.id,
+                  "failed",
+                  error instanceof Error
+                    ? error.message
+                    : i18n.t("chat.queue.sendFailed"),
+                );
+            }
+            return false;
+          }
+        }
+
         // Wait until the backend finishes the currently running task before
         // sending the next one. This preserves order task1 → task2 → task3
         // and prevents firing while task1 is still generating.
@@ -457,18 +588,29 @@ async function startBackgroundQueue(
           ["paused", "error"].includes(store.getRunState(queueKey))
         )
           return false;
-        const item = store.getQueue(queueKey)[0];
+        const latestQueue = store.getQueue(queueKey);
+        const item = latestQueue[0];
         if (!item || item.status !== "pending") return false;
         if (item.id !== waitingItem.id) return true;
+        const batchItems = selectBatchItems(
+          latestQueue,
+          item,
+          item.agentId || "default",
+          sendOptions.quantity,
+        );
+        const batchMessages = buildQueueBatchGroups(batchItems);
         const clientMessageId = item.clientMessageId ?? item.id;
 
-        // Mark as sending — visible to other tabs and to the foreground page
+        // Mark the whole immutable batch as sending before issuing its POST.
+        // A partial state transition would make crash recovery ambiguous.
         // if the user navigates back. Crucially we do NOT remove the item
         // before the request completes, so a navigate-back during sending
         // still shows the item in the queue.
-        useMessageQueueStore
-          .getState()
-          .setItemStatus(queueKey, item.id, "sending");
+        for (const entry of batchItems) {
+          useMessageQueueStore
+            .getState()
+            .setItemStatus(queueKey, entry.id, "sending");
+        }
 
         // Mirror what foreground customFetch does: cache the in-flight user
         // text in shared storage so that when ChatPage re-mounts during
@@ -478,16 +620,19 @@ async function startBackgroundQueue(
         if (chatIdForStatus || backendSessionId || queueKey) {
           // Build content items matching the POST body (stored-name format)
           // so patchLastUserMessage can rebuild the user card with attachments.
-          const contentItems: Array<{ type: string; [key: string]: unknown }> =
-            [
-              { type: "text", text: item.text },
-              ...buildAttachmentContentItems(item.attachments),
-            ];
+          const pendingMessages = batchMessages.map((entry) => ({
+            text: extractUserMessageText(entry),
+            clientMessageId: String(
+              entry.metadata[QWENPAW_CLIENT_MESSAGE_ID_KEY],
+            ),
+            content: entry.content,
+          }));
           sessionApi.setLastUserMessage(
             [chatIdForStatus, queueKey],
-            item.text,
-            contentItems,
+            pendingMessages.map((entry) => entry.text).join("\n"),
+            pendingMessages[pendingMessages.length - 1]?.content,
             clientMessageId,
+            pendingMessages,
           );
         }
 
@@ -510,18 +655,7 @@ async function startBackgroundQueue(
                 ...(item.requestContext
                   ? { request_context: item.requestContext }
                   : {}),
-                input: [
-                  {
-                    role: "user",
-                    metadata: {
-                      [QWENPAW_CLIENT_MESSAGE_ID_KEY]: clientMessageId,
-                    },
-                    content: [
-                      { type: "text", text: item.text },
-                      ...buildAttachmentContentItems(item.attachments),
-                    ],
-                  },
-                ],
+                input: batchMessages,
                 session_id: item.backendSessionId || backendSessionId,
                 user_id: item.userId || DEFAULT_USER_ID,
                 channel: item.channel || DEFAULT_CHANNEL,
@@ -531,6 +665,9 @@ async function startBackgroundQueue(
               clientMessageId,
               undefined,
               item.requestContext,
+              batchMessages.map((entry) =>
+                String(entry.metadata[QWENPAW_CLIENT_MESSAGE_ID_KEY]),
+              ),
             ),
             queueAgentId,
             queueKey,
@@ -561,10 +698,6 @@ async function startBackgroundQueue(
           }
 
           if (!res.ok) {
-            sessionApi.discardLastUserMessage(
-              [chatIdForStatus, queueKey],
-              clientMessageId,
-            );
             throw new Error(`HTTP ${res.status}`);
           }
           setPendingThinking(queueAgentId, queueKey, null);
@@ -605,7 +738,9 @@ async function startBackgroundQueue(
           if (fetchStarted) {
             // The accepted run continues server-side after its SSE subscriber
             // disconnects; foreground history/reconnect owns the result.
-            useMessageQueueStore.getState().remove(queueKey, item.id);
+            for (const entry of batchItems) {
+              useMessageQueueStore.getState().remove(queueKey, entry.id);
+            }
           }
           // Without headers receipt is unknown. Keep `sending` for history
           // reconciliation; scope cancellation is neither failure nor a retry.
@@ -614,18 +749,22 @@ async function startBackgroundQueue(
 
         if (fetchSucceeded) {
           // Accepted requests leave the unsent queue, just as in the SDK path.
-          useMessageQueueStore.getState().remove(queueKey, item.id);
+          for (const entry of batchItems) {
+            useMessageQueueStore.getState().remove(queueKey, entry.id);
+          }
         } else {
-          // Network/HTTP failure: keep the item visible with `failed` status
-          // so the user can retry from the queue panel on next visit.
-          useMessageQueueStore
-            .getState()
-            .setItemStatus(
-              queueKey,
-              item.id,
-              "failed",
-              i18n.t("chat.queue.sendFailed"),
-            );
+          // Network/HTTP failure: keep the full batch visible with `failed`
+          // status so the user can retry it without losing sibling messages.
+          for (const entry of batchItems) {
+            useMessageQueueStore
+              .getState()
+              .setItemStatus(
+                queueKey,
+                entry.id,
+                "failed",
+                i18n.t("chat.queue.sendFailed"),
+              );
+          }
           return false;
         }
         return true;
@@ -648,7 +787,12 @@ function startAllBackgroundQueues(excludeSessionId?: string) {
     const key = localStorage.key(i);
     if (!key || !key.startsWith(STORAGE_PREFIX)) continue;
     const sessionId = key.slice(STORAGE_PREFIX.length);
-    if (sessionId === excludeSessionId || isDraftQueueKey(sessionId)) continue;
+    if (
+      sessionId.startsWith("options:") ||
+      sessionId === excludeSessionId ||
+      isDraftQueueKey(sessionId)
+    )
+      continue;
     // Skip sessions already running a background sender
     if (hasBackgroundQueue(sessionId)) continue;
     try {
@@ -1603,6 +1747,59 @@ export default function ChatPage() {
       if (!initialQueueId || !execution) return false;
 
       const agentId = item.agentId || selectedAgent;
+      const queueOptions = useMessageQueueStore
+        .getState()
+        .getSendOptions(initialQueueId);
+      if (
+        queueOptions.timing === "before_next_request" &&
+        item.status === "pending" &&
+        queueSessionId !== "new"
+      ) {
+        const steeringBatch = selectBatchItems(
+          useMessageQueueStore.getState().getQueue(initialQueueId),
+          item,
+          agentId,
+          queueOptions.quantity,
+        );
+        const steeringMessages = buildQueueBatchGroups(steeringBatch);
+        for (const entry of steeringBatch) {
+          useMessageQueueStore
+            .getState()
+            .setItemStatus(initialQueueId, entry.id, "sending");
+        }
+        try {
+          const steeringResult = await submitQueueSteering(
+            sessionApi.getRealIdForSession(queueSessionId) || queueSessionId,
+            agentId,
+            steeringMessages,
+            signal,
+          );
+          if (steeringResult === "accepted") {
+            useMessageQueueStore.getState().setCurrentSendingId(item.id);
+            return true;
+          }
+          for (const entry of steeringBatch) {
+            useMessageQueueStore
+              .getState()
+              .setItemStatus(initialQueueId, entry.id, "pending");
+          }
+        } catch (error) {
+          if (signal.aborted) return false;
+          for (const entry of steeringBatch) {
+            useMessageQueueStore
+              .getState()
+              .setItemStatus(
+                initialQueueId,
+                entry.id,
+                "failed",
+                error instanceof Error
+                  ? error.message
+                  : i18n.t("chat.queue.sendFailed"),
+              );
+          }
+          return false;
+        }
+      }
       const runtimeSessionId =
         item.backendSessionId ||
         (queueSessionId !== "new"
@@ -1662,18 +1859,31 @@ export default function ChatPage() {
         )
           return false;
         item = freshItem;
-        // Batch the contiguous compatible text items. Attachments, mentions,
-        // quotes and request-context boundaries are sent as separate turns.
+        // Batch the contiguous compatible messages. Every queue item remains
+        // an independent content group with its own metadata and receipt ID.
+        const sendOptions = store.getSendOptions(freshQueueId);
         batchItems = selectBatchItems(
           store.getQueue(freshQueueId),
           item,
           agentId,
+          sendOptions.quantity,
         );
         store.setCurrentSendingId(item.id);
         for (const entry of batchItems) {
           store.setItemStatus(freshQueueId, entry.id, "sending");
         }
         const preparedQuery = beginLoopModeSubmission(item.text);
+        const packedBatch = buildQueueBatchGroups(
+          batchItems,
+          preparedQuery,
+        ).map((entry) => ({
+          text: extractUserMessageText(entry),
+          content: entry.content,
+          metadata: entry.metadata,
+          clientMessageId: String(
+            entry.metadata[QWENPAW_CLIENT_MESSAGE_ID_KEY],
+          ),
+        }));
         const accepted = await awaitQueueAcceptance(
           execution.execute(
             {
@@ -1684,16 +1894,10 @@ export default function ChatPage() {
               channel,
               agent_id: agentId,
               biz_params:
-                batchItems.length > 1
+                packedBatch.length > 1
                   ? {
                       ...item.bizParams,
-                      qwenpaw_batch_input: batchItems.map((entry) => ({
-                        // The leading submission text already carries the
-                        // loop-mode transformation; pack that result so
-                        // expansion does not silently undo it.
-                        text: entry.id === item.id ? preparedQuery : entry.text,
-                        clientMessageId: entry.clientMessageId ?? entry.id,
-                      })),
+                      qwenpaw_batch_input: packedBatch,
                     }
                   : item.bizParams,
               context: buildChatSubmissionContext(
@@ -1923,7 +2127,14 @@ export default function ChatPage() {
         return;
       autoSendTimerRef.current = null;
       if (!isChatActiveRef.current) return;
-      if (chatLoadingRef.current) return;
+      const timing = useMessageQueueStore
+        .getState()
+        .getSendOptions(queueKey).timing;
+      if (
+        chatLoadingRef.current &&
+        timing !== "before_next_request"
+      )
+        return;
       // Only the owner tab is allowed to actually send.
       if (!isOwnerRef.current) return;
       // Respect pause/error state — read fresh from store
@@ -3757,10 +3968,58 @@ export default function ChatPage() {
         const queueText = usesQwenPawBackend
           ? prepareLoopModeMessage(val)
           : val;
+        const groupContent: Array<{
+          type: string;
+          [key: string]: unknown;
+        }> = [
+          ...(queueText ? [{ type: "text", text: queueText }] : []),
+          ...buildAttachmentContentItems(queueAttachments),
+          ...(data.images || []).map((image) => ({
+            type: "image",
+            image_url: toStoredName(image.url),
+          })),
+        ];
+        const groupMetadata = {
+          ...(data.mentions?.length
+            ? {
+                mentions: data.mentions.map((mention) => ({
+                  id: mention.value,
+                  name: mention.value,
+                  ...(mention.type ? { type: mention.type } : {}),
+                })),
+              }
+            : {}),
+          ...(data.quote ? { quote: { ...data.quote } } : {}),
+        };
+        const capturedGroups = [
+          {
+            text: queueText,
+            content: groupContent,
+            metadata: groupMetadata,
+          },
+        ];
         useMessageQueueStore.getState().enqueue(queueKey, {
           text: queueText,
+          messageGroups: capturedGroups.length ? capturedGroups : undefined,
           attachments:
             queueAttachments.length > 0 ? queueAttachments : undefined,
+          images:
+            data.images?.map((image) => ({
+              url: image.url,
+              thumbUrl: image.thumbUrl,
+              name: image.name,
+            })) ?? undefined,
+          mentions:
+            data.mentions?.map((mention) => ({
+              id: mention.value,
+              name: mention.value,
+            })) ?? undefined,
+          quote: data.quote
+            ? {
+                messageId: data.quote.messageId,
+                text: data.quote.text,
+              }
+            : undefined,
           agentId: selectedAgent,
           backendSessionId: enqueueIdentity.sessionId,
           userId: enqueueIdentity.userId,

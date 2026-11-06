@@ -31,8 +31,8 @@ describe("isBatchable", () => {
     ["images", { images: [{ path: "/tmp/a.png" } as never] }],
     ["mentions", { mentions: [{ id: "user-1" } as never] }],
     ["quotes", { quote: { text: "quoted" } as never }],
-  ])("rejects an item with %s", (_label, overrides) => {
-    expect(isBatchable(makeItem(overrides))).toBe(false);
+  ])("accepts an item with %s as an independent message group", (_label, overrides) => {
+    expect(isBatchable(makeItem(overrides))).toBe(true);
   });
 });
 
@@ -49,13 +49,21 @@ describe("selectBatchItems", () => {
     expect(batch.map((entry) => entry.id)).toEqual(["a", "b", "c"]);
   });
 
+  it("honors one-at-a-time quantity without skipping FIFO siblings", () => {
+    const queue = [
+      makeItem({ id: "a" }),
+      makeItem({ id: "b" }),
+      makeItem({ id: "c" }),
+    ];
+
+    expect(selectBatchItems(queue, queue[0], "agent-a", "one").map((item) => item.id)).toEqual([
+      "a",
+    ]);
+  });
+
   it.each([
     ["sending", { status: "sending" as const }],
     ["failed", { status: "failed" as const }],
-    ["attachment", { attachments: [{ path: "/tmp/b.txt" } as never] }],
-    ["image", { images: [{ path: "/tmp/b.png" } as never] }],
-    ["mention", { mentions: [{ id: "user-1" } as never] }],
-    ["quote", { quote: { text: "quoted" } as never }],
     ["another agent", { agentId: "agent-b" }],
     ["another session", { backendSessionId: "session-b" }],
     ["another user", { userId: "user-b" }],
@@ -84,14 +92,22 @@ describe("selectBatchItems", () => {
     expect(batch.map((entry) => entry.id)).toEqual(["a"]);
   });
 
-  it("does not batch a non-pending or non-text starting item", () => {
+  it("batches multimodal starting items as independent groups", () => {
     const item = makeItem({
       id: "start",
       attachments: [{ path: "/tmp/a.txt" } as never],
+      mentions: [{ id: "user-1", name: "User 1" }],
+      quote: { messageId: "m-1", text: "quoted" },
     });
-    const queue = [item, makeItem({ id: "next" })];
+    const next = makeItem({
+      id: "next",
+      images: [{ path: "/tmp/a.png" } as never],
+    });
 
-    expect(selectBatchItems(queue, item, "agent-a")).toEqual([item]);
+    expect(selectBatchItems([item, next], item, "agent-a")).toEqual([
+      item,
+      next,
+    ]);
   });
 
   it("allows equivalent context objects with different key order", () => {

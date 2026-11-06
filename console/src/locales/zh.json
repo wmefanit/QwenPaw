@@ -4017,7 +4017,13 @@
       "file": "文件",
       "noChatWarning": "请先发送一条消息创建对话，再使用队列功能",
       "queueFull": "队列已满（最多 {{max}} 条），请先发送或删除部分消息",
-      "otherTabOwner": "当前标签页仅入队，发送由其他标签页完成"
+      "otherTabOwner": "当前标签页仅入队，发送由其他标签页完成",
+      "sendTiming": "队列发送时机",
+      "afterTurn": "本轮结束后",
+      "beforeNextRequest": "下一次模型请求前",
+      "sendQuantity": "队列发送数量",
+      "oneAtATime": "逐条发送",
+      "allPending": "全部待发消息"
     },
     "group": {
       "noGroups": "暂无分组",

@@ -18,7 +18,9 @@ import {
   stopBackgroundTaskWatcher,
 } from "../../../hooks/useBackgroundTaskWatcher";
 import {
+  DEFAULT_QUEUE_SEND_OPTIONS,
   type QueueItem,
+  type QueueSendOptions,
   useMessageQueueStore,
 } from "../../../stores/messageQueueStore";
 import BackgroundTaskPanel from "./BackgroundTaskPanel";
@@ -64,6 +66,9 @@ export default function ChatSenderTabsPanel({
   const runState = useMessageQueueStore(
     (s) => s.runStates[queueSessionId] ?? "idle",
   );
+  const queueSendOptions = useMessageQueueStore(
+    (s) => s.sendOptions[queueSessionId] ?? DEFAULT_QUEUE_SEND_OPTIONS,
+  );
   const [batchBusy, setBatchBusy] = useState(false);
   const [showFinished, setShowFinished] = useState(false);
 
@@ -87,6 +92,10 @@ export default function ChatSenderTabsPanel({
   const hasQueue = queueItems.length > 0;
   const hasRunningBg = runningTasks.length > 0;
   const isPausedOrError = runState === "paused" || runState === "error";
+
+  useEffect(() => {
+    useMessageQueueStore.getState().loadSendOptions(queueSessionId);
+  }, [queueSessionId]);
 
   const [activeTab, setActiveTab] = useState<TabKey>(() =>
     hasRunningBg ? "bg" : hasQueue ? "queue" : hasBg ? "bg" : "queue",
@@ -303,7 +312,37 @@ export default function ChatSenderTabsPanel({
         </button>
       </div>
     ) : activeTab === "queue" && hasQueue ? (
-      <div style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+      <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <select
+          aria-label={t("chat.queue.sendTiming")}
+          value={queueSendOptions.timing}
+          onChange={(event) =>
+            useMessageQueueStore.getState().setSendOptions(queueSessionId, {
+              ...queueSendOptions,
+              timing: event.target.value as QueueSendOptions["timing"],
+            })
+          }
+          style={{ ...chipBtnStyle, maxWidth: 154, padding: "2px 6px" }}
+        >
+          <option value="after_turn">{t("chat.queue.afterTurn")}</option>
+          <option value="before_next_request">
+            {t("chat.queue.beforeNextRequest")}
+          </option>
+        </select>
+        <select
+          aria-label={t("chat.queue.sendQuantity")}
+          value={queueSendOptions.quantity}
+          onChange={(event) =>
+            useMessageQueueStore.getState().setSendOptions(queueSessionId, {
+              ...queueSendOptions,
+              quantity: event.target.value as QueueSendOptions["quantity"],
+            })
+          }
+          style={{ ...chipBtnStyle, maxWidth: 110, padding: "2px 6px" }}
+        >
+          <option value="one">{t("chat.queue.oneAtATime")}</option>
+          <option value="all">{t("chat.queue.allPending")}</option>
+        </select>
         {runState === "paused" && (
           <span style={{ fontSize: 11, color: "#faad14", marginRight: 2 }}>
             {t("chat.queue.paused")}

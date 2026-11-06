@@ -4158,7 +4158,13 @@
       "file": "File",
       "noChatWarning": "Please send a message first to create a conversation before using the queue",
       "queueFull": "Queue is full (max {{max}} items), please send or remove some messages first",
-      "otherTabOwner": "This tab queues only; sending is handled by another tab"
+      "otherTabOwner": "This tab queues only; sending is handled by another tab",
+      "sendTiming": "Queue send timing",
+      "afterTurn": "After this turn",
+      "beforeNextRequest": "Before the next model request",
+      "sendQuantity": "Queue send quantity",
+      "oneAtATime": "One at a time",
+      "allPending": "All pending messages"
     },
     "group": {
       "noGroups": "No groups yet",

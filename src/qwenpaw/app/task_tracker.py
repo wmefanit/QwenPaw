@@ -46,6 +46,10 @@ class _RunState:
     start_time: Optional[datetime] = None
     finish_time: Optional[datetime] = None
     owner: object | None = None
+    steering_messages: list[Any] = field(default_factory=list)
+    steering_receipts: set[str] = field(default_factory=set)
+    steering_closed: bool = False
+    steering_window_open: bool = True
 
 
 class TaskTracker:
@@ -74,6 +78,93 @@ class TaskTracker:
         if state is None or state.task.done():
             return "idle"
         return "running"
+
+    @staticmethod
+    def _steering_receipt(message: Any) -> str | None:
+        metadata = getattr(message, "metadata", None)
+        if isinstance(metadata, dict):
+            value = metadata.get("qwenpaw_client_message_id")
+            return str(value) if value else None
+        return None
+
+    async def enqueue_steering(
+        self,
+        run_key: str,
+        messages: list[Any],
+    ) -> list[str]:
+        """Add user messages to an active run's next-model-request queue.
+
+        Receipt IDs make repeated HTTP submissions idempotent for the lifetime
+        of the run, including retries after the middleware has taken a batch.
+        """
+        async with self._lock:
+            state = self._runs.get(run_key)
+            if (
+                state is None
+                or state.task.done()
+                or state.steering_closed
+                or not state.steering_window_open
+            ):
+                return []
+            accepted: list[str] = []
+            for message in messages:
+                receipt = self._steering_receipt(message)
+                if not receipt:
+                    continue
+                accepted.append(receipt)
+                if receipt in state.steering_receipts:
+                    continue
+                state.steering_receipts.add(receipt)
+                state.steering_messages.append(message)
+            return accepted
+
+    async def open_steering_window(self, run_key: str) -> None:
+        async with self._lock:
+            state = self._runs.get(run_key)
+            if state is not None and not state.task.done() and not state.steering_closed:
+                state.steering_window_open = True
+
+    async def close_steering_window(self, run_key: str) -> None:
+        async with self._lock:
+            state = self._runs.get(run_key)
+            if state is not None and not state.task.done() and not state.steering_closed:
+                state.steering_window_open = False
+
+    async def take_steering(
+        self,
+        run_key: str,
+        *,
+        allow_closed_window: bool = False,
+    ) -> list[Any]:
+        """Atomically take messages before a normal reasoning call."""
+        async with self._lock:
+            state = self._runs.get(run_key)
+            if (
+                state is None
+                or state.task.done()
+                or state.steering_closed
+                or (not allow_closed_window and not state.steering_window_open)
+                or not state.steering_messages
+            ):
+                return []
+            messages = state.steering_messages
+            state.steering_messages = []
+            return messages
+
+    async def restore_steering(
+        self,
+        run_key: str,
+        messages: list[Any],
+    ) -> None:
+        """Restore a batch if runtime conversion failed before injection."""
+        async with self._lock:
+            state = self._runs.get(run_key)
+            if (
+                state is not None
+                and not state.task.done()
+                and not state.steering_closed
+            ):
+                state.steering_messages = messages + state.steering_messages
 
     async def get_global_status(self) -> dict:
         """Get global agent status summary.
@@ -339,6 +430,7 @@ class TaskTracker:
                             run.finish_time = finish_time
                             # pylint: disable=protected-access
                             tracker._global_last_finish_at = finish_time
+                            run.steering_closed = True
                             for q in run.queues:
                                 q.put_nowait(_SENTINEL)
                             # pylint: disable=protected-access

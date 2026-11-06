@@ -11,6 +11,16 @@ import {
 export type QueueItemStatus = "pending" | "sending" | "failed" | "sent";
 
 export type QueueRunState = "idle" | "running" | "paused" | "error";
+export type QueueSendTiming = "after_turn" | "before_next_request";
+export type QueueSendQuantity = "one" | "all";
+export interface QueueSendOptions {
+  timing: QueueSendTiming;
+  quantity: QueueSendQuantity;
+}
+export const DEFAULT_QUEUE_SEND_OPTIONS: QueueSendOptions = {
+  timing: "after_turn",
+  quantity: "all",
+};
 
 /** Attachment reference (URL only, binary not stored in queue) */
 export interface QueueAttachment {
@@ -24,6 +34,7 @@ export interface QueueAttachment {
 export interface QueueImage {
   url: string;
   thumbUrl?: string;
+  name?: string;
 }
 
 /** Mention reference */
@@ -39,10 +50,19 @@ export interface QueueQuote {
 }
 
 /** Full message body for a queued item (Phase 3 ready) */
+export interface QueueMessageGroup {
+  text: string;
+  clientMessageId?: string;
+  content?: Array<{ type: string; [key: string]: unknown }>;
+  metadata?: Record<string, unknown>;
+}
+
 export interface QueueItem {
   id: string;
   clientMessageId?: string;
   text: string;
+  /** A single queue item may carry an atomic batch of separate user messages. */
+  messageGroups?: QueueMessageGroup[];
   attachments?: QueueAttachment[];
   images?: QueueImage[];
   mentions?: QueueMention[];
@@ -65,6 +85,7 @@ export interface QueueItem {
 /** Data required to enqueue a new item */
 export interface QueueItemInput {
   text: string;
+  messageGroups?: QueueMessageGroup[];
   attachments?: QueueAttachment[];
   images?: QueueImage[];
   mentions?: QueueMention[];
@@ -146,6 +167,40 @@ export const STORAGE_PREFIX = "qwenpaw:message-queue:";
 interface PersistedQueue {
   items: QueueItem[];
   runState: QueueRunState;
+}
+
+function getSendOptionsStorageKey(sessionId: string): string {
+  return `${STORAGE_PREFIX}options:${sessionId}`;
+}
+
+function readSendOptions(sessionId: string): QueueSendOptions {
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(getSendOptionsStorageKey(sessionId)) || "null",
+    );
+    if (
+      parsed &&
+      (parsed.timing === "after_turn" ||
+        parsed.timing === "before_next_request") &&
+      (parsed.quantity === "one" || parsed.quantity === "all")
+    ) {
+      return parsed;
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return DEFAULT_QUEUE_SEND_OPTIONS;
+}
+
+function writeSendOptions(sessionId: string, options: QueueSendOptions): void {
+  try {
+    localStorage.setItem(
+      getSendOptionsStorageKey(sessionId),
+      JSON.stringify(options),
+    );
+  } catch {
+    // ignore storage errors
+  }
 }
 
 export function getStorageKey(sessionId: string): string {
@@ -260,10 +315,12 @@ type BroadcastPayload = {
     | "clear"
     | "setItemStatus"
     | "migrate"
-    | "runState";
+    | "runState"
+    | "sendOptions";
   sessionId: string;
   items?: QueueItem[];
   runState?: QueueRunState;
+  sendOptions?: QueueSendOptions;
   // For migrate: target session id (sessionId is the source)
   toSessionId?: string;
   sourceItems?: QueueItem[];
@@ -427,6 +484,11 @@ export function holdOwnershipLock(
 interface MessageQueueStore {
   /** All session queues: sessionId -> items */
   queues: Record<string, QueueItem[]>;
+  /** Send timing and quantity are isolated and persisted per chat. */
+  sendOptions: Record<string, QueueSendOptions>;
+  setSendOptions: (sessionId: string, options: QueueSendOptions) => void;
+  getSendOptions: (sessionId: string) => QueueSendOptions;
+  loadSendOptions: (sessionId: string) => void;
   /** Per-session run state: sessionId -> QueueRunState (replaces global runState) */
   runStates: Record<string, QueueRunState>;
   /** Currently sending item ID */
@@ -478,6 +540,10 @@ interface MessageQueueStore {
   applyRemoteItems: (sessionId: string, items: QueueItem[]) => void;
   /** Internal: apply a remote run-state update without re-broadcasting. */
   applyRemoteRunState: (sessionId: string, runState: QueueRunState) => void;
+  applyRemoteSendOptions: (
+    sessionId: string,
+    options: QueueSendOptions,
+  ) => void;
 }
 
 /** Maximum number of items allowed in a single session queue */
@@ -485,6 +551,26 @@ export const MAX_QUEUE_SIZE = 50;
 
 export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
   queues: {},
+  sendOptions: {},
+  setSendOptions: (sessionId, options) => {
+    const normalized = { ...options };
+    writeSendOptions(sessionId, normalized);
+    set((state) => ({
+      sendOptions: { ...state.sendOptions, [sessionId]: normalized },
+    }));
+    broadcast({ type: "sendOptions", sessionId, sendOptions: normalized });
+  },
+  getSendOptions: (sessionId) =>
+    get().sendOptions[sessionId] ?? readSendOptions(sessionId),
+  loadSendOptions: (sessionId) => {
+    if (get().sendOptions[sessionId]) return;
+    set((state) => ({
+      sendOptions: {
+        ...state.sendOptions,
+        [sessionId]: readSendOptions(sessionId),
+      },
+    }));
+  },
   runStates: {},
   currentSendingId: null,
   lastMigratedTo: null,
@@ -514,10 +600,18 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
     // Capture backend session_id so background sender targets the correct
     // session even if the session list is cleared after agent switch.
     const backendSessionId = input.backendSessionId;
+    const clientMessageId = createClientMessageId();
+    const messageGroups = input.messageGroups
+      ? structuredClone(input.messageGroups).map((group) => ({
+          ...group,
+          clientMessageId: group.clientMessageId || clientMessageId,
+        }))
+      : undefined;
     const item: QueueItem = {
       id: nextQueueId(),
-      clientMessageId: createClientMessageId(),
+      clientMessageId,
       text: input.text,
+      messageGroups,
       attachments: input.attachments,
       images: input.images,
       mentions: input.mentions,
@@ -756,6 +850,12 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
 
   loadFromStorage: (sessionId: string) => {
     const saved = readQueueFromStorage(sessionId);
+    set((state) => ({
+      sendOptions: {
+        ...state.sendOptions,
+        [sessionId]: readSendOptions(sessionId),
+      },
+    }));
     if (saved) {
       set((state) => ({
         queues: { ...state.queues, [sessionId]: saved.items },
@@ -798,6 +898,12 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
   applyRemoteRunState: (sessionId: string, runState: QueueRunState) => {
     set((state) => ({
       runStates: { ...state.runStates, [sessionId]: runState },
+    }));
+  },
+
+  applyRemoteSendOptions: (sessionId, options) => {
+    set((state) => ({
+      sendOptions: { ...state.sendOptions, [sessionId]: options },
     }));
   },
 }));
@@ -868,6 +974,12 @@ if (typeof window !== "undefined") {
           .applyRemoteRunState(data.sessionId, data.runState);
         return;
       }
+      if (data.type === "sendOptions" && data.sendOptions) {
+        useMessageQueueStore
+          .getState()
+          .applyRemoteSendOptions(data.sessionId, data.sendOptions);
+        return;
+      }
       if (data.runState) {
         store.applyRemoteRunState(data.sessionId, data.runState);
       }
@@ -881,7 +993,17 @@ if (typeof window !== "undefined") {
   // also covers the case where another tab wrote without our channel.
   window.addEventListener("storage", (event) => {
     if (!event.key || !event.key.startsWith(STORAGE_PREFIX)) return;
-    const sessionId = event.key.slice(STORAGE_PREFIX.length);
+    const suffix = event.key.slice(STORAGE_PREFIX.length);
+    if (suffix.startsWith("options:")) {
+      const sessionId = suffix.slice("options:".length);
+      const store = useMessageQueueStore.getState();
+      store.applyRemoteSendOptions(
+        sessionId,
+        readSendOptions(sessionId),
+      );
+      return;
+    }
+    const sessionId = suffix;
     const store = useMessageQueueStore.getState();
     if (event.newValue == null) {
       store.applyRemoteItems(sessionId, []);

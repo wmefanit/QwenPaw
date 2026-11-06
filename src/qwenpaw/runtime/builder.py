@@ -1343,6 +1343,26 @@ class AgentBuilder:
         """
         mws: list[Any] = []
 
+        request_channel_meta = getattr(ctx.request, "channel_meta", None)
+        steering_run_key = (
+            request_channel_meta.get("qwenpaw_run_key")
+            if isinstance(request_channel_meta, dict)
+            else None
+        )
+        # Console chat runs are registered on the owning Workspace tracker,
+        # not the app-global service tracker (which tracks tool calls).
+        workspace = getattr(ctx, "workspace", None)
+        task_tracker = getattr(workspace, "task_tracker", None)
+        if steering_run_key and task_tracker is not None:
+            from .queue_steering import QueueSteeringMiddleware
+
+            mws.append(
+                QueueSteeringMiddleware(
+                    task_tracker=task_tracker,
+                    run_key=str(steering_run_key),
+                ),
+            )
+
         pruning_middleware = None
         try:
             pruning_middleware = (
