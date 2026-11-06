@@ -26,6 +26,7 @@ from starlette.responses import StreamingResponse
 
 from qwenpaw.schemas import (
     AgentRequest,
+    Message,
     _coerce_content_item,
 )
 from qwenpaw.tool_calls import CancelReason
@@ -70,6 +71,11 @@ _bg_lock = asyncio.Lock()
 class MarkInboxReadRequest(BaseModel):
     event_ids: list[str] = []
     all: bool = False
+
+
+class QueueSteeringRequest(BaseModel):
+    chat_id: str
+    input: list[Message]
 
 
 MAX_DEBUG_LOG_LINES = 1000
@@ -515,6 +521,10 @@ async def post_console_chat(
         # ContextVarsSetupHook (from the chat meta persisted above);
         # the router no longer pre-resolves or injects them.
 
+        # Bind the active run key in server-controlled request metadata. This
+        # is intentionally assigned after chat resolution; a caller cannot
+        # steer a different Chat by spoofing the payload.
+        native_payload.setdefault("meta", {})["qwenpaw_run_key"] = chat.id
         queue, is_new_run = await tracker.attach_or_start(
             chat.id,
             native_payload,
@@ -565,6 +575,44 @@ async def post_console_chat(
             "Connection": "keep-alive",
         },
     )
+
+
+@router.post(
+    "/chat/steer",
+    status_code=200,
+    summary="Queue user messages before the next model request",
+)
+async def post_console_chat_steer(
+    body: QueueSteeringRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Inject complete user message groups into one active Console Chat."""
+    if not body.input:
+        raise HTTPException(status_code=400, detail="input must not be empty")
+    if any(message.role not in (None, "user") for message in body.input):
+        raise HTTPException(status_code=400, detail="only user messages may be steered")
+
+    workspace = await get_agent_for_request(request)
+    chat = await workspace.chat_manager.get_chat(body.chat_id)
+    if chat is None or chat.channel != "console":
+        raise HTTPException(status_code=404, detail="Console chat not found")
+
+    from ...runtime.message_convert import _request_input_to_msgs
+
+    messages = _request_input_to_msgs(body.input)
+    if len(messages) != len(body.input):
+        raise HTTPException(status_code=400, detail="unable to convert input messages")
+
+    accepted = await workspace.task_tracker.enqueue_steering(
+        body.chat_id,
+        messages,
+    )
+    if len(accepted) != len(body.input):
+        raise HTTPException(
+            status_code=409,
+            detail="No active run for this chat or message receipt is missing",
+        )
+    return {"accepted_client_message_ids": accepted}
 
 
 @router.post(

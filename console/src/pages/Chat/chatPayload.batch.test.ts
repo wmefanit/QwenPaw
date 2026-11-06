@@ -107,16 +107,22 @@ describe("expandBatchInput", () => {
     expect(result.bizParams).toBe(bizParams);
   });
 
-  it("does not expand a single-entry batch", () => {
+  it("expands and strips a single-entry batch", () => {
     const input = [template];
     const bizParams = {
+      source: "console_chat",
       [BATCH_INPUT_KEY]: [{ text: "only", clientMessageId: "id-1" }],
     };
 
     const result = expandBatchInput(input, bizParams);
 
-    expect(result.input).toBe(input);
-    expect(result.bizParams).toBe(bizParams);
+    expect(result.input).not.toBe(input);
+    expect(result.input).toHaveLength(1);
+    expect((result.input[0].content as Array<{ text: string }>)[0].text).toBe(
+      "only",
+    );
+    expect(receiptId(result.input[0])).toBe("id-1");
+    expect(result.bizParams).toEqual({ source: "console_chat" });
   });
 
   it("expands every entry into an independent user message", () => {
@@ -161,20 +167,75 @@ describe("expandBatchInput", () => {
     expect(new Set(ids).size).toBe(2);
   });
 
-  it("preserves the template metadata on every expanded message", () => {
+  it("preserves template and per-entry metadata without sibling overwrites", () => {
     const input = [template];
     const bizParams = {
       [BATCH_INPUT_KEY]: [
-        { text: "alpha", clientMessageId: "id-a" },
-        { text: "beta", clientMessageId: "id-b" },
+        {
+          text: "alpha",
+          clientMessageId: "id-a",
+          metadata: { mentions: [{ id: "user-a" }], tag: "a" },
+        },
+        {
+          text: "beta",
+          clientMessageId: "id-b",
+          metadata: { quote: { messageId: "q-b", text: "quoted" }, tag: "b" },
+        },
       ],
     };
 
     const { input: expanded } = expandBatchInput(input, bizParams);
 
-    for (const entry of expanded) {
-      expect((entry.metadata as Record<string, unknown>).existing).toBe("kept");
-    }
+    expect(expanded[0].metadata).toEqual({
+      existing: "kept",
+      mentions: [{ id: "user-a" }],
+      tag: "a",
+      [QWENPAW_CLIENT_MESSAGE_ID_KEY]: "id-a",
+    });
+    expect(expanded[1].metadata).toEqual({
+      existing: "kept",
+      quote: { messageId: "q-b", text: "quoted" },
+      tag: "b",
+      [QWENPAW_CLIENT_MESSAGE_ID_KEY]: "id-b",
+    });
+  });
+
+  it("preserves each entry's multimodal content blocks", () => {
+    const input = [template];
+    const bizParams = {
+      [BATCH_INPUT_KEY]: [
+        {
+          text: "image caption",
+          clientMessageId: "id-image",
+          content: [
+            { type: "text", text: "image caption" },
+            { type: "image", image_url: "uploads/cat.png" },
+          ],
+        },
+        {
+          text: "audio prompt",
+          clientMessageId: "id-audio",
+          content: [
+            { type: "text", text: "audio prompt" },
+            { type: "audio", data: "uploads/voice.wav" },
+          ],
+        },
+      ],
+    };
+
+    const { input: expanded } = expandBatchInput(input, bizParams);
+
+    expect(expanded.map((entry) => entry.content)).toEqual([
+      [
+        { type: "text", text: "image caption" },
+        { type: "image", image_url: "uploads/cat.png" },
+      ],
+      [
+        { type: "text", text: "audio prompt" },
+        { type: "audio", data: "uploads/voice.wav" },
+      ],
+    ]);
+    expect(expanded.map(receiptId)).toEqual(["id-image", "id-audio"]);
   });
 
   it("strips the private batch key from biz_params", () => {
