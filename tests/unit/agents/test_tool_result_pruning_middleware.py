@@ -613,6 +613,7 @@ def test_builder_places_pruning_outside_tool_coordinator(tmp_path):
         ),
     )
     ctx = types.SimpleNamespace(
+        request=types.SimpleNamespace(channel_meta={}),
         app_services=types.SimpleNamespace(tool_coordinator=ToolCoordinator()),
         workspace=types.SimpleNamespace(workspace_dir=str(tmp_path)),
     )
@@ -666,6 +667,7 @@ def test_builder_adds_pruning_for_scroll_strategy(tmp_path):
         ),
     )
     ctx = types.SimpleNamespace(
+        request=types.SimpleNamespace(channel_meta={}),
         app_services=types.SimpleNamespace(tool_coordinator=ToolCoordinator()),
         workspace=types.SimpleNamespace(workspace_dir=str(tmp_path)),
     )
@@ -835,6 +837,7 @@ def test_scroll_pruning_disabled_leaves_current_result_unbounded(tmp_path):
         ),
     )
     ctx = types.SimpleNamespace(
+        request=types.SimpleNamespace(channel_meta={}),
         app_services=types.SimpleNamespace(tool_coordinator=ToolCoordinator()),
         workspace=types.SimpleNamespace(workspace_dir=str(tmp_path)),
     )
