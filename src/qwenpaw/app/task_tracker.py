@@ -431,6 +431,24 @@ class TaskTracker:
                             # pylint: disable=protected-access
                             tracker._global_last_finish_at = finish_time
                             run.steering_closed = True
+                            if run.steering_messages:
+                                receipts = [
+                                    receipt
+                                    for message in run.steering_messages
+                                    if (
+                                        receipt := self._steering_receipt(
+                                            message,
+                                        )
+                                    )
+                                ]
+                                logger.warning(
+                                    "run ended with unconsumed queue "
+                                    "steering messages run_key=%s "
+                                    "message_count=%d receipts=%s",
+                                    run_key,
+                                    len(run.steering_messages),
+                                    receipts,
+                                )
                             for q in run.queues:
                                 q.put_nowait(_SENTINEL)
                             # pylint: disable=protected-access
