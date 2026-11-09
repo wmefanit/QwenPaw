@@ -211,6 +211,7 @@ async def test_request_stop_cancels_live_run():
     tracker = TaskTracker()
     started = asyncio.Event()
     cancel_reasons = []
+    stream_closed = asyncio.Event()
 
     async def long_stream(_payload):
         started.set()
@@ -219,6 +220,8 @@ async def test_request_stop_cancels_live_run():
         except asyncio.CancelledError as exc:
             cancel_reasons.append(exc.args)
             raise
+        finally:
+            stream_closed.set()
         yield "never"
 
     await tracker.attach_or_start(
@@ -233,6 +236,7 @@ async def test_request_stop_cancels_live_run():
     stopped = await tracker.request_stop("run-cancel", reason="timeout")
     assert stopped is True
     assert cancel_reasons == [("timeout",)]
+    assert stream_closed.is_set()
 
     # Give the task loop time to process cancellation and cleanup.
     await asyncio.sleep(0.05)
@@ -245,6 +249,48 @@ async def test_request_stop_returns_false_when_no_run():
     tracker = TaskTracker()
 
     assert await tracker.request_stop("missing") is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_owner_drains_only_owned_runs():
+    tracker = TaskTracker()
+    owner_a = object()
+    owner_b = object()
+    started_a = asyncio.Event()
+    started_b = asyncio.Event()
+    closed_a = asyncio.Event()
+    release_b = asyncio.Event()
+
+    async def stream_a(_payload):
+        started_a.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed_a.set()
+        yield "unreachable"
+
+    async def stream_b(_payload):
+        started_b.set()
+        await release_b.wait()
+        yield "data: b\\n\\n"
+
+    await tracker.attach_or_start("owner-a", None, stream_a, owner=owner_a)
+    queue_b, _ = await tracker.attach_or_start(
+        "owner-b",
+        None,
+        stream_b,
+        owner=owner_b,
+    )
+    await asyncio.wait_for(started_a.wait(), timeout=1)
+    await asyncio.wait_for(started_b.wait(), timeout=1)
+
+    assert await tracker.cancel_owner(owner_a, timeout=1)
+    assert closed_a.is_set()
+    assert await tracker.get_status("owner-b") == "running"
+
+    release_b.set()
+    async for _ in tracker.stream_from_queue(queue_b, "owner-b"):
+        pass
 
 
 # ---------------------------------------------------------------------------
