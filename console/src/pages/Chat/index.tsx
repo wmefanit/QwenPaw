@@ -274,6 +274,7 @@ import { useAgentRunningConfigApprovalLevel } from "../../hooks/useAgentRunningC
 import { normalizeLevel, type ToolExecutionLevel } from "../../utils/approval";
 import {
   useMessageQueueStore,
+  DEFAULT_QUEUE_SEND_OPTIONS,
   getQueueKey,
   isDraftQueueKey,
   recoverLegacyDraftQueue,
@@ -303,12 +304,14 @@ import {
  * expected by the backend POST body and by patchLastUserMessage.
  */
 function buildAttachmentContentItems(
-  attachments: Array<{
-    url: string;
-    name?: string;
-    type?: string;
-    size?: number;
-  }> | undefined,
+  attachments:
+    | Array<{
+        url: string;
+        name?: string;
+        type?: string;
+        size?: number;
+      }>
+    | undefined,
 ): Array<{ type: string; [key: string]: unknown }> {
   if (!attachments || attachments.length === 0) return [];
   return attachments.map((a) => {
@@ -1656,6 +1659,9 @@ export default function ChatPage() {
   messageQueueRef.current = messageQueue;
   const autoSendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const queueRunState = useMessageQueueStore((s) => s.runStates[queueKey]);
+  const queueSendOptions = useMessageQueueStore(
+    (s) => s.sendOptions[queueKey] ?? DEFAULT_QUEUE_SEND_OPTIONS,
+  );
 
   const sessionApprovalLevelRef = useRef<ToolExecutionLevel | null>(null);
   const backendControlsRef = useRef<Record<string, unknown>>({});
@@ -2130,11 +2136,7 @@ export default function ChatPage() {
       const timing = useMessageQueueStore
         .getState()
         .getSendOptions(queueKey).timing;
-      if (
-        chatLoadingRef.current &&
-        timing !== "before_next_request"
-      )
-        return;
+      if (chatLoadingRef.current && timing !== "before_next_request") return;
       // Only the owner tab is allowed to actually send.
       if (!isOwnerRef.current) return;
       // Respect pause/error state — read fresh from store
@@ -2681,17 +2683,17 @@ export default function ChatPage() {
     };
   }, [queueSessionId, queueKey]);
 
-  // Auto-send next queue item when:
-  // 1. Response just completed (loading→idle), OR
-  // 2. The queue changes while idle (including cross-tab receipt removal or
-  //    resume). A head change need not pass through an empty queue.
+  // Re-evaluate queued work after a response, queue update, or send-option
+  // change. Next-request steering must also run while the SDK is loading.
   // Uses a delayed timer so session switches can cancel it before it fires.
   useEffect(() => {
     const wasLoading = prevChatLoadingRef.current;
     prevChatLoadingRef.current = chatLoading;
 
     const responseJustCompleted = wasLoading && !chatLoading;
-    const itemsJustQueued = messageQueue.length > 0 && !chatLoading;
+    const itemsJustQueued =
+      messageQueue.length > 0 &&
+      (!chatLoading || queueSendOptions.timing === "before_next_request");
 
     if (responseJustCompleted) {
       // Refresh loop mode before scheduling the next item. The execution
@@ -2704,6 +2706,7 @@ export default function ChatPage() {
     chatLoading,
     messageQueue,
     queueRunState,
+    queueSendOptions,
     scheduleNextSend,
     syncLoopModeStatus,
   ]);

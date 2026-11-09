@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from types import SimpleNamespace
+from typing import Awaitable, Callable
+from unittest.mock import AsyncMock
 
 import pytest
 from agentscope.agent import Agent, ReActConfig
@@ -76,7 +78,11 @@ async def _active_tracker():
 class _QueueSteeringModel(ChatModelBase):
     """Inject steering during the first provider request, then finish."""
 
-    def __init__(self, tracker: TaskTracker) -> None:
+    def __init__(
+        self,
+        tracker: TaskTracker,
+        during_first_request: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         super().__init__(
             credential=None,
             model="queue-steering-test",
@@ -86,6 +92,7 @@ class _QueueSteeringModel(ChatModelBase):
         )
         self.formatter = SimpleNamespace(supported_input_media_types=[])
         self._tracker = tracker
+        self._during_first_request = during_first_request
         self.requests: list[list[Msg]] = []
 
     async def __call__(
@@ -97,11 +104,14 @@ class _QueueSteeringModel(ChatModelBase):
     ) -> ChatResponse:
         self.requests.append(list(messages))
         if len(self.requests) == 1:
-            accepted = await self._tracker.enqueue_steering(
-                "chat-1",
-                [_message("receipt-model-boundary", "STEERING_MARKER")],
-            )
-            assert accepted == ["receipt-model-boundary"]
+            if self._during_first_request is not None:
+                await self._during_first_request()
+            else:
+                accepted = await self._tracker.enqueue_steering(
+                    "chat-1",
+                    [_message("receipt-model-boundary", "STEERING_MARKER")],
+                )
+                assert accepted == ["receipt-model-boundary"]
             return ChatResponse(
                 content=[
                     ToolCallBlock(
@@ -271,6 +281,114 @@ async def test_queued_message_is_injected_into_next_real_model_request():
         assert events
     finally:
         await _finish(queue, release)
+
+
+@pytest.mark.asyncio
+async def test_http_batch_arrives_in_order_at_next_model_request(monkeypatch):
+    """Exercise the HTTP route and real agent loop with a gated local model."""
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from qwenpaw.app.routers import console
+
+    tracker = TaskTracker()
+    first_request_started = asyncio.Event()
+    release_first_request = asyncio.Event()
+
+    async def hold_first_request():
+        first_request_started.set()
+        await release_first_request.wait()
+
+    model = _QueueSteeringModel(tracker, hold_first_request)
+    tool_results: list[str] = []
+    agent = _bare_qwenpaw_agent(model, tracker, tool_results)
+    workspace = SimpleNamespace(
+        task_tracker=tracker,
+        chat_manager=SimpleNamespace(
+            get_chat=AsyncMock(
+                return_value=SimpleNamespace(id="chat-1", channel="console"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        console,
+        "get_agent_for_request",
+        AsyncMock(return_value=workspace),
+    )
+    app = FastAPI()
+    app.include_router(console.router, prefix="/api")
+    events = []
+
+    async def stream(_payload):
+        async for event in agent.reply_stream(
+            inputs=_message("receipt-start", "start"),
+        ):
+            events.append(event)
+            yield "data: {}\n\n"
+
+    queue, is_new_run = await tracker.attach_or_start("chat-1", None, stream)
+    assert is_new_run
+    body = {
+        "chat_id": "chat-1",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": text}],
+                "metadata": {"qwenpaw_client_message_id": receipt},
+            }
+            for receipt, text in [
+                ("receipt-first", "QUEUE_FIRST"),
+                ("receipt-second", "QUEUE_SECOND"),
+            ]
+        ],
+    }
+    try:
+        await asyncio.wait_for(first_request_started.wait(), timeout=2)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            for _ in range(2):
+                response = await client.post(
+                    "/api/console/chat/steer",
+                    headers={"X-Agent-Id": "default"},
+                    json=body,
+                )
+                assert response.status_code == 200, response.text
+                assert response.json() == {
+                    "accepted_client_message_ids": [
+                        "receipt-first",
+                        "receipt-second",
+                    ],
+                }
+        # Accepting the batch must not interrupt the in-flight model request.
+        assert len(model.requests) == 1
+        assert tool_results == []
+        assert not any(
+            message.metadata.get("qwenpaw_client_message_id")
+            in {"receipt-first", "receipt-second"}
+            for message in model.requests[0]
+        )
+    finally:
+        await _finish(queue, release_first_request)
+
+    assert len(model.requests) == 2
+    assert tool_results == ["tool completed"]
+    received = [
+        message
+        for message in model.requests[1]
+        if message.metadata.get("qwenpaw_client_message_id")
+        in {"receipt-first", "receipt-second"}
+    ]
+    assert [message.get_text_content() for message in received] == [
+        "QUEUE_FIRST",
+        "QUEUE_SECOND",
+    ]
+    assert [
+        message.metadata["qwenpaw_client_message_id"] for message in received
+    ] == ["receipt-first", "receipt-second"]
+    assert not await tracker.take_steering("chat-1")
+    assert events
 
 
 @pytest.mark.asyncio

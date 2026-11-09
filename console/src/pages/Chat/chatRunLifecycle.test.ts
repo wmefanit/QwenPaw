@@ -4,6 +4,9 @@ import { join } from "node:path";
 import ts from "typescript";
 import { ChatRunLifecycle } from "@agentscope-ai/chat/lib/AgentScopeRuntimeWebUI/core/Execution/runLifecycle";
 import { request } from "../../api/request";
+import { selectBatchItems } from "../../stores/batchSelection";
+import { extractUserMessageText } from "./utils";
+import { submitQueueSteering } from "./queueSteering";
 import {
   useMessageQueueStore,
   withBackgroundSendLock,
@@ -43,6 +46,7 @@ beforeEach(() => {
   localStorage.clear();
   useMessageQueueStore.setState({
     queues: {},
+    sendOptions: {},
     runStates: {},
     currentSendingId: null,
   });
@@ -115,22 +119,27 @@ const chatSource = ts.createSourceFile(
   true,
   ts.ScriptKind.TSX,
 );
-const backgroundWorkerNode = chatSource.statements.find(
-  (node): node is ts.FunctionDeclaration =>
-    ts.isFunctionDeclaration(node) &&
-    node.name?.text === "startBackgroundQueue",
-);
-if (!backgroundWorkerNode)
-  throw new Error("Missing production startBackgroundQueue");
-const backgroundWorkerJS = ts.transpileModule(
-  backgroundWorkerNode.getText(chatSource),
-  {
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2020,
-      module: ts.ModuleKind.None,
-    },
+const workerFunctionNames = [
+  "buildQueueItemContent",
+  "buildQueueItemGroups",
+  "buildQueueBatchGroups",
+  "buildQueueItemMetadata",
+  "startBackgroundQueue",
+];
+const workerFunctions = workerFunctionNames.map((name) => {
+  const node = chatSource.statements.find(
+    (candidate): candidate is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(candidate) && candidate.name?.text === name,
+  );
+  if (!node) throw new Error(`Missing production function ${name}`);
+  return node.getText(chatSource);
+});
+const backgroundWorkerJS = ts.transpileModule(workerFunctions.join("\n"), {
+  compilerOptions: {
+    target: ts.ScriptTarget.ES2020,
+    module: ts.ModuleKind.None,
   },
-).outputText;
+}).outputText;
 
 function backgroundWorkerFixture() {
   const sessionApi = {
@@ -143,6 +152,9 @@ function backgroundWorkerFixture() {
     awaitInChatScope,
     waitForChatIdle,
     recoverSendingQueueHead,
+    selectBatchItems,
+    extractUserMessageText,
+    submitQueueSteering,
     stopBackgroundQueue,
     setBackgroundAbort,
     clearBackgroundAbortIfCurrent,
@@ -197,6 +209,10 @@ describe("background queue transport handoff", () => {
       },
     });
     vi.mocked(request).mockResolvedValue({ status: "idle", messages: [] });
+    useMessageQueueStore.getState().setSendOptions(key, {
+      timing: "after_turn",
+      quantity: "one",
+    });
     useMessageQueueStore.getState().enqueue(key, {
       text: "first",
       agentId: "agent-a",
@@ -318,7 +334,7 @@ describe("background queue transport handoff", () => {
         .map((item) => item.status),
     ).toEqual(["failed", "pending"]);
     expect(useMessageQueueStore.getState().getRunState(key)).toBe("error");
-    expect(fixture.sessionApi.discardLastUserMessage).toHaveBeenCalledTimes(1);
+    expect(fixture.sessionApi.discardLastUserMessage).not.toHaveBeenCalled();
     await expectReleased();
   });
 });
