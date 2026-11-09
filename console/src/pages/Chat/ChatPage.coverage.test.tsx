@@ -38,6 +38,8 @@ const {
   mockRequiresQwenPawModel,
   mockHoldOwnershipLock,
   mockRuntimeMount,
+  mockSdkLoading,
+  mockQueuePanelEnabled,
   mockFetchActiveLoopMode,
   mockSessionProjectDirectory,
   mockHydrateBackgroundTasksForSession,
@@ -57,6 +59,8 @@ const {
   mockRequiresQwenPawModel: vi.fn(() => true),
   mockHoldOwnershipLock: vi.fn(),
   mockRuntimeMount: vi.fn(),
+  mockSdkLoading: vi.fn(() => false),
+  mockQueuePanelEnabled: vi.fn(() => false),
   mockFetchActiveLoopMode: vi.fn(() => Promise.resolve(null)),
   mockSessionProjectDirectory: vi.fn(),
   mockHydrateBackgroundTasksForSession: vi.fn(() => Promise.resolve()),
@@ -120,6 +124,7 @@ vi.mock("@agentscope-ai/chat", () => ({
     return (
       <div data-testid="chat-ui">
         {props.options?.theme?.rightHeader}
+        {mockQueuePanelEnabled() && props.options?.sender?.beforeUI}
         {props.options?.sender?.prefix}
         {props.options?.sender?.actionAffix}
       </div>
@@ -134,9 +139,9 @@ vi.mock("@agentscope-ai/chat", () => ({
   useChatAnywhereSessions: vi.fn(() => ({ createSession: vi.fn() })),
   useChatAnywhereInput: vi.fn((select: any) =>
     select({
-      loading: false,
+      loading: mockSdkLoading(),
       setLoading: vi.fn(),
-      getLoading: vi.fn(() => false),
+      getLoading: vi.fn(() => mockSdkLoading()),
       setSessionLoading: vi.fn(),
       setDisabled: vi.fn(),
     }),
@@ -337,7 +342,10 @@ vi.mock("@/stores/uploadLimitStore", () => ({
 
 vi.mock("@/stores/backgroundTasksStore", () => ({
   useBackgroundTasksStore: Object.assign(
-    vi.fn(() => ({ tasks: [] })),
+    vi.fn((selector?: any) => {
+      const state = { tasks: [], removeTasks: vi.fn() };
+      return selector ? selector(state) : state;
+    }),
     {
       getState: vi.fn(() => ({ tasks: [] })),
     },
@@ -415,9 +423,19 @@ vi.mock("../../components/LoopInput", () => ({
   LoopModeSelector: () => null,
 }));
 
-vi.mock("./components/ChatSenderTabsPanel", () => ({
-  default: () => <div data-testid="sender-tabs" />,
-}));
+vi.mock("./components/ChatSenderTabsPanel", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("./components/ChatSenderTabsPanel")
+  >();
+  return {
+    default: (props: Parameters<typeof actual.default>[0]) =>
+      mockQueuePanelEnabled() ? (
+        <actual.default {...props} />
+      ) : (
+        <div data-testid="sender-tabs" />
+      ),
+  };
+});
 
 vi.mock("./components/ApprovalLevelToggle", () => ({
   default: () => <div data-testid="approval-toggle" />,
@@ -556,6 +574,8 @@ describe("ChatPage coverage", () => {
     mockGetChatStatus.mockResolvedValue({ status: "idle" });
     mockRuntimeSubmit.mockReset();
     mockRuntimeMount.mockReset();
+    mockSdkLoading.mockReturnValue(false);
+    mockQueuePanelEnabled.mockReturnValue(false);
     mockSelectedAgent.mockReturnValue("default");
     mockFetchActiveLoopMode.mockClear();
     mockSessionProjectDirectory.mockClear();
@@ -580,6 +600,7 @@ describe("ChatPage coverage", () => {
     localStorage.clear();
     useMessageQueueStore.setState({
       queues: {},
+      sendOptions: {},
       runStates: {},
       currentSendingId: null,
       lastMigratedTo: null,
@@ -1417,6 +1438,233 @@ describe("ChatPage coverage", () => {
       }),
     ]);
     act(() => useMessageQueueStore.getState().clear(chatId));
+  });
+
+  describe("next-request queue steering", () => {
+    const chatId = "80000000-0000-4000-8000-000000000001";
+
+    function steeringPosts() {
+      return vi
+        .mocked(fetch)
+        .mock.calls.filter(
+          ([url, init]) =>
+            String(url).endsWith("/console/chat/steer") &&
+            init?.method === "POST",
+        );
+    }
+
+    async function renderRunningQueue(preselected = false) {
+      mockSdkLoading.mockReturnValue(true);
+      mockQueuePanelEnabled.mockReturnValue(true);
+      mockGetChatStatus.mockResolvedValue({ status: "running" });
+      vi.mocked(fetch).mockImplementation(async (url, init) => {
+        if (
+          String(url).endsWith("/console/chat/steer") &&
+          init?.method === "POST"
+        ) {
+          const body = JSON.parse(String(init.body));
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              accepted_client_message_ids: body.input.map(
+                (entry: { metadata: { qwenpaw_client_message_id: string } }) =>
+                  entry.metadata.qwenpaw_client_message_id,
+              ),
+            }),
+          } as Response;
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ "Content-Type": "application/json" }),
+          json: async () => ({ status: "running", messages: [] }),
+        } as Response;
+      });
+      if (preselected) {
+        useMessageQueueStore.getState().setSendOptions(chatId, {
+          timing: "before_next_request",
+          quantity: "all",
+        });
+      }
+      const view = renderWithProviders(<ChatPage />, {
+        initialEntries: [`/chat/${chatId}`],
+      });
+      await screen.findByTestId("chat-ui");
+      await act(async () => {});
+      await act(async () => {
+        for (const query of ["QUEUE_FIRST", "QUEUE_SECOND"]) {
+          expect(await capturedOptions.sender.beforeSubmit({ query })).toEqual({
+            proceed: false,
+            clear: true,
+          });
+        }
+      });
+      expect(
+        useMessageQueueStore
+          .getState()
+          .getQueue(chatId)
+          .map((item) => item.text),
+      ).toEqual(["QUEUE_FIRST", "QUEUE_SECOND"]);
+      return view;
+    }
+
+    async function waitPastSendDelay() {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 650));
+      });
+    }
+
+    function changeTiming(value: "after_turn" | "before_next_request") {
+      const select = screen
+        .getAllByRole("combobox")
+        .find((element) =>
+          element.querySelector('option[value="before_next_request"]'),
+        );
+      expect(select).toBeDefined();
+      fireEvent.change(select!, { target: { value } });
+    }
+
+    async function expectOrderedBatch() {
+      await waitFor(() => expect(steeringPosts()).toHaveLength(1), {
+        timeout: 1800,
+      });
+      const [, init] = steeringPosts()[0];
+      const body = JSON.parse(String(init?.body));
+      expect(body.chat_id).toBe(chatId);
+      expect(init?.headers).toMatchObject({ "X-Agent-Id": "default" });
+      expect(
+        body.input.map(
+          (entry: { content: Array<{ text: string }> }) =>
+            entry.content[0].text,
+        ),
+      ).toEqual(["QUEUE_FIRST", "QUEUE_SECOND"]);
+      expect(mockRuntimeSubmit).not.toHaveBeenCalled();
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.some(([url]) =>
+            String(url).includes("/console/chat/stop"),
+          ),
+      ).toBe(false);
+    }
+
+    it("sends the full ordered batch when options were selected before enqueueing during a run", async () => {
+      const view = await renderRunningQueue(true);
+      try {
+        await expectOrderedBatch();
+        await waitPastSendDelay();
+        expect(steeringPosts()).toHaveLength(1);
+        // An HTTP receipt alone must not remove messages from the queue.
+        expect(
+          useMessageQueueStore
+            .getState()
+            .getQueue(chatId)
+            .map((item) => item.status),
+        ).toEqual(["sending", "sending"]);
+      } finally {
+        act(() => useMessageQueueStore.getState().clear(chatId));
+        view.unmount();
+      }
+    });
+
+    it("switching the real controls sends an already queued batch without waiting for the run to finish", async () => {
+      const view = await renderRunningQueue();
+      try {
+        await waitPastSendDelay();
+        expect(steeringPosts()).toHaveLength(0);
+        changeTiming("before_next_request");
+        const quantity = screen
+          .getAllByRole("combobox")
+          .find((element) => element.querySelector('option[value="all"]'));
+        fireEvent.change(quantity!, { target: { value: "all" } });
+        expect(useMessageQueueStore.getState().getSendOptions(chatId)).toEqual({
+          timing: "before_next_request",
+          quantity: "all",
+        });
+        await expectOrderedBatch();
+      } finally {
+        act(() => useMessageQueueStore.getState().clear(chatId));
+        view.unmount();
+      }
+    });
+
+    it("switching back to after-turn mode cancels the scheduled steering attempt", async () => {
+      const view = await renderRunningQueue(true);
+      try {
+        changeTiming("after_turn");
+        await waitPastSendDelay();
+        expect(steeringPosts()).toHaveLength(0);
+        expect(mockRuntimeSubmit).not.toHaveBeenCalled();
+        expect(
+          useMessageQueueStore
+            .getState()
+            .getQueue(chatId)
+            .map((item) => item.status),
+        ).toEqual(["pending", "pending"]);
+      } finally {
+        act(() => useMessageQueueStore.getState().clear(chatId));
+        view.unmount();
+      }
+    });
+
+    it("respects queue pause and sends the batch after resume during the run", async () => {
+      const view = await renderRunningQueue(true);
+      try {
+        act(() =>
+          useMessageQueueStore.getState().setRunState(chatId, "paused"),
+        );
+        await waitPastSendDelay();
+        expect(steeringPosts()).toHaveLength(0);
+        act(() =>
+          useMessageQueueStore.getState().setRunState(chatId, "running"),
+        );
+        await expectOrderedBatch();
+      } finally {
+        act(() => useMessageQueueStore.getState().clear(chatId));
+        view.unmount();
+      }
+    });
+
+    it("does not submit a running queue from a non-owner tab", async () => {
+      mockHoldOwnershipLock.mockImplementation(() => new Promise(() => {}));
+      const view = await renderRunningQueue(true);
+      try {
+        await waitPastSendDelay();
+        expect(steeringPosts()).toHaveLength(0);
+        expect(mockRuntimeSubmit).not.toHaveBeenCalled();
+      } finally {
+        act(() => useMessageQueueStore.getState().clear(chatId));
+        view.unmount();
+      }
+    });
+
+    it("keeps one-at-a-time selection when steering during a run", async () => {
+      const view = await renderRunningQueue(true);
+      try {
+        act(() =>
+          useMessageQueueStore.getState().setSendOptions(chatId, {
+            timing: "before_next_request",
+            quantity: "one",
+          }),
+        );
+        await waitFor(() => expect(steeringPosts()).toHaveLength(1), {
+          timeout: 1800,
+        });
+        const body = JSON.parse(String(steeringPosts()[0][1]?.body));
+        expect(body.input).toHaveLength(1);
+        expect(body.input[0].content[0].text).toBe("QUEUE_FIRST");
+        expect(
+          useMessageQueueStore
+            .getState()
+            .getQueue(chatId)
+            .map((item) => item.status),
+        ).toEqual(["sending", "pending"]);
+      } finally {
+        act(() => useMessageQueueStore.getState().clear(chatId));
+        view.unmount();
+      }
+    });
   });
 
   it("allows a submission when the backend chat is idle", async () => {
