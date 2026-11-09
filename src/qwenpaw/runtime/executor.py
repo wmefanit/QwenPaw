@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Awaitable, Callable
 
 from .envelope import Envelope
 from .heartbeat import (
@@ -30,9 +30,15 @@ class AgentExecutor:
     ``HookContext``).
     """
 
-    def __init__(self, agent: Any, envelope: Envelope) -> None:
+    def __init__(
+        self,
+        agent: Any,
+        envelope: Envelope,
+        checkpoint: Callable[[Any, str], Awaitable[bool]] | None = None,
+    ) -> None:
         self._agent = agent
         self._envelope = envelope
+        self._checkpoint = checkpoint
 
     async def run(
         self,
@@ -58,6 +64,27 @@ class AgentExecutor:
 
             async for obj in self._envelope.translate_event(event):
                 yield obj
+
+            if self._checkpoint is not None and self._is_checkpoint_event(
+                event,
+            ):
+                await self._checkpoint(self._agent, event.type)
+
+    @staticmethod
+    def _is_checkpoint_event(event: Any) -> bool:
+        """Return whether *event* follows a complete persisted state mutation."""
+        from agentscope.event import EventType
+
+        event_type = getattr(event, "type", None)
+        if hasattr(event_type, "value"):
+            event_type = event_type.value
+        if event_type in {
+            EventType.REPLY_START.value,
+            EventType.REPLY_END.value,
+            EventType.TOOL_RESULT_END.value,
+        }:
+            return True
+        return False
 
     def _maybe_stamp_finished_at(self, event: Any) -> None:
         """Backfill ``finished_at`` on the reply's assistant message.

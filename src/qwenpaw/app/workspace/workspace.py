@@ -840,6 +840,17 @@ class Workspace:
             f"{sanitize_log_value(self.agent_id)} (final={final})",
         )
 
+        # Persist/cancel background runs while their workspace services and
+        # session store are still alive. During reload, only runs owned by
+        # this instance are canceled; replacement-instance runs are untouched.
+        drained = await self._task_tracker.cancel_owner(self)
+        if not drained:
+            raise TimeoutError(
+                "workspace "
+                f"{sanitize_log_value(self.agent_id)} still has active runs "
+                "after shutdown deadline; keeping session services alive",
+            )
+
         # Stop all services via ServiceManager (handles reuse automatically)
         await self._service_manager.stop_all(
             final=final,

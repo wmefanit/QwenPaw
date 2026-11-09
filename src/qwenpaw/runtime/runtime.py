@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from copy import deepcopy
 from typing import Any, AsyncGenerator
 
 from ..agents.acp.meta import ACP_EPHEMERAL_META_KEY
@@ -30,6 +31,29 @@ from .message_convert import _get_last_user_text, _request_input_to_msgs
 from .phases import Phase
 
 logger = logging.getLogger(__name__)
+
+
+async def _await_durable_task(
+    task: asyncio.Task,
+    *,
+    propagate_cancel: bool,
+) -> None:
+    """Wait until a durable write settles even if the caller is cancelled."""
+    was_cancelled = False
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            was_cancelled = True
+            logger.warning("waiting for session save after cancellation")
+
+    if task.cancelled():
+        raise asyncio.CancelledError("session save task was cancelled")
+    error = task.exception()
+    if error is not None:
+        raise error
+    if was_cancelled and propagate_cancel:
+        raise asyncio.CancelledError("cancelled after session save completed")
 
 
 class Runtime:
@@ -121,11 +145,26 @@ class Runtime:
                     skip_agent = True
 
             if not skip_agent:
+                # Persist the accepted user input before the first model call
+                # can block. The snapshot is detached from the live agent and
+                # is taken before synthetic runtime hints are injected.
+                await self._save_session_checkpoint(
+                    ctx,
+                    "request-start",
+                    include_pending_input=True,
+                )
                 self._apply_context_injections(ctx)
                 # --- [fixed 3] execute agent ---
                 async for ev in envelope.emit_response_created():
                     yield ev
-                executor = AgentExecutor(ctx.agent, envelope)
+                executor = AgentExecutor(
+                    ctx.agent,
+                    envelope,
+                    checkpoint=lambda _agent, reason: self._save_session_checkpoint(
+                        ctx,
+                        str(reason),
+                    ),
+                )
                 logger.debug(
                     "Agent input: %s",
                     _get_last_user_text(
@@ -147,8 +186,12 @@ class Runtime:
         except GeneratorExit:
             # The consumer closed the stream; persist without yielding an
             # error envelope into a generator that is already closing.
-            ctx.error = asyncio.CancelledError()
-            await self._try_save_on_cancel(ctx)
+            from .cancellation import CURRENT_CANCEL_REASON
+
+            reason = CURRENT_CANCEL_REASON.get()
+            if reason is not None:
+                ctx.error = asyncio.CancelledError(reason)
+                await self._try_save_on_cancel(ctx)
             raise
         except (asyncio.CancelledError, KeyboardInterrupt) as e:
             ctx.error = e
@@ -241,6 +284,90 @@ class Runtime:
                     exc_info=True,
                 )
 
+    async def _save_session_checkpoint(
+        self,
+        ctx: HookContext,
+        reason: str,
+        *,
+        status: str = "in_progress",
+        include_pending_input: bool = False,
+    ) -> bool:
+        """Persist a detached snapshot of the current durable agent state.
+
+        Call only at state-consistent boundaries (request accepted, complete
+        model response, or complete tool result). The synchronous state dump
+        happens before the first await so another turn cannot mutate the
+        snapshot while the disk write is in flight.
+        """
+        request = getattr(ctx, "request", None)
+        request_context = getattr(request, "request_context", None)
+        if isinstance(request_context, dict):
+            ephemeral = request_context.get(ACP_EPHEMERAL_META_KEY)
+            if ephemeral is True or (
+                isinstance(ephemeral, str)
+                and ephemeral.lower() in {"1", "true", "yes"}
+            ):
+                return False
+
+        from .console_turn_state import REGENERATE_FROM
+
+        if (getattr(request, "request_context", None) or {}).get(
+            REGENERATE_FROM,
+        ):
+            return False
+
+        agent = getattr(ctx, "agent", None)
+        workspace = getattr(ctx, "workspace", None)
+        session = getattr(workspace, "session", None) if workspace else None
+        if agent is None or session is None or not hasattr(agent, "state_dict"):
+            return False
+
+        from ..hooks.cron.cron_hook import restore_cron_context
+        from ._state_utils import StateProxy
+        from .console_turn_state import stamp_console_turn
+
+        restore_cron_context(ctx)
+        proxy = StateProxy()
+        proxy.data = deepcopy(agent.state_dict())
+        if include_pending_input:
+            state = proxy.data.get("state", {})
+            context = state.setdefault("context", [])
+            existing_ids = {item.get("id") for item in context}
+            for message in ctx.input_msgs:
+                serialized = message.model_dump(mode="json")
+                if serialized.get("id") not in existing_ids:
+                    context.append(deepcopy(serialized))
+        proxy.data["mode_state"] = deepcopy(ctx.mode_state)
+        stamp_console_turn(proxy.data, request, status, ctx.error)
+        user_id = getattr(request, "user_id", "") or ctx.session_id
+        channel = getattr(request, "channel", "") or ""
+
+        try:
+            save_task = asyncio.create_task(
+                session.save_session_state(
+                    session_id=ctx.session_id,
+                    user_id=user_id,
+                    channel=channel,
+                    agent=proxy,
+                ),
+                name=f"session-checkpoint:{ctx.session_id}",
+            )
+            await _await_durable_task(save_task, propagate_cancel=True)
+        except Exception:
+            logger.exception(
+                "session checkpoint failed (session=%s reason=%s)",
+                ctx.session_id,
+                reason,
+            )
+            return False
+
+        logger.info(
+            "session checkpoint persisted (session=%s reason=%s)",
+            ctx.session_id,
+            reason,
+        )
+        return True
+
     async def _try_save_on_cancel(self, ctx: HookContext) -> None:
         """Best-effort session save on cancellation.
 
@@ -249,22 +376,20 @@ class Runtime:
         interrupted turn's text is not lost on reload.
 
         ``state_dict()`` is called synchronously to snapshot the agent
-        state *before* any further event-loop iteration.  The I/O write
-        is wrapped in ``asyncio.shield`` so it completes even when the
-        outer task's ``_must_cancel`` flag triggers a re-cancellation on
-        the next ``await``.  In that case the shielded inner task still
-        runs to completion in the background; the ``proxy`` owns an
-        independent copy of the data so ``agent.close()`` in the
-        ``finally`` block cannot corrupt it.
+        state *before* any further event-loop iteration. The I/O write runs
+        in a dedicated task and this method waits for it to settle even if
+        the outer task is cancelled again. The ``proxy`` owns an independent
+        copy of the data so ``agent.close()`` in the ``finally`` block cannot
+        corrupt it.
 
         .. note:: Why hardcoded instead of a hook?
 
            This runs *outside* the ``try/except`` that wraps
            ``hooks.run(Phase.ON_ERROR)``, so it executes even when
-           re-cancellation skips all ON_ERROR hooks.  The synchronous
-           parts (inject + restore + state_dict) complete before any ``await``,
-           and ``asyncio.shield`` protects the I/O — guarantees that a
-           generic hook framework cannot provide.
+           re-cancellation skips all ON_ERROR hooks. The synchronous
+           parts (inject + restore + state_dict) complete before awaiting
+           the dedicated save task, a guarantee a generic hook framework
+           cannot provide.
 
         TODO: Session saving and cron history restoration have cancel-path
          equivalents here. Other ``POST_RESPONSE`` and plugin hooks are
@@ -330,14 +455,16 @@ class Runtime:
             )
             user_id = getattr(request, "user_id", "") or ctx.session_id
             channel = getattr(request, "channel", "") or ""
-            await asyncio.shield(
+            save_task = asyncio.create_task(
                 session.save_session_state(
                     session_id=ctx.session_id,
                     user_id=user_id,
                     channel=channel,
                     agent=proxy,
                 ),
+                name=f"session-cancel-save:{ctx.session_id}",
             )
+            await _await_durable_task(save_task, propagate_cancel=False)
             logger.info(
                 "cancel-save: persisted interrupted turn "
                 "(session=%s reason=%s)",
@@ -345,9 +472,9 @@ class Runtime:
                 cancel_reason or "unknown",
             )
         except asyncio.CancelledError:
-            logger.info(
-                "cancel-save: outer await re-cancelled, inner save "
-                "continues in background (session=%s)",
+            logger.warning(
+                "cancel-save: interrupted before session save completed "
+                "(session=%s)",
                 ctx.session_id,
             )
         except Exception:

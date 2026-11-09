@@ -147,6 +147,42 @@ class TaskTracker:
                 and (owner is None or state.owner is owner)
             }
 
+    async def cancel_owner(
+        self,
+        owner: object,
+        *,
+        timeout: float = 10.0,
+    ) -> bool:
+        """Cancel and drain runs owned by a workspace before it is stopped.
+
+        The owner filter matters during zero-downtime reload: old and new
+        workspace instances may share a tracker while only the old instance
+        is being torn down.
+        """
+        tasks = list(
+            (await self.snapshot_active_tasks(owner=owner)).values(),
+        )
+        if not tasks:
+            return True
+
+        logger.info(
+            "stopping %d active run(s) for workspace owner %s",
+            len(tasks),
+            getattr(owner, "agent_id", "unknown"),
+        )
+        for task in tasks:
+            task.cancel("shutdown")
+
+        _, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            logger.error(
+                "timed out draining %d run(s) for workspace owner %s",
+                len(pending),
+                getattr(owner, "agent_id", "unknown"),
+            )
+            return False
+        return True
+
     async def wait_tasks_done(
         self,
         tasks: list[asyncio.Future],
@@ -292,6 +328,7 @@ class TaskTracker:
 
             async def _producer() -> None:
                 start_time = datetime.now(timezone.utc)
+                stream_iterator = None
 
                 try:
                     tracker = tracker_ref()
@@ -301,7 +338,8 @@ class TaskTracker:
                             # pylint: disable=protected-access
                             tracker._global_last_run_at = start_time
 
-                    async for sse in stream_fn(payload):
+                    stream_iterator = stream_fn(payload).__aiter__()
+                    async for sse in stream_iterator:
                         tracker = tracker_ref()
                         if tracker is None:
                             return
@@ -309,8 +347,16 @@ class TaskTracker:
                             run.buffer.append(sse)
                             for q in run.queues:
                                 q.put_nowait(sse)
-                except asyncio.CancelledError:
-                    logger.debug("run cancelled run_key=%s", run_key)
+                except asyncio.CancelledError as exc:
+                    from ..runtime.cancellation import CURRENT_CANCEL_REASON
+
+                    reason = str(exc.args[0]) if exc.args else None
+                    CURRENT_CANCEL_REASON.set(reason)
+                    logger.debug(
+                        "run cancelled run_key=%s reason=%s",
+                        run_key,
+                        reason or "unknown",
+                    )
                 except Exception:
                     logger.exception("run error run_key=%s", run_key)
                     err_sse = (
@@ -324,6 +370,25 @@ class TaskTracker:
                             for q in run.queues:
                                 q.put_nowait(err_sse)
                 finally:
+                    # ``async for`` does not guarantee that an async
+                    # generator is closed when its consumer task is cancelled.
+                    # Close it explicitly so Runtime's GeneratorExit cleanup
+                    # can persist the interrupted session before shutdown.
+                    close = getattr(stream_iterator, "aclose", None)
+                    if close is not None:
+                        try:
+                            await close()
+                        except asyncio.CancelledError:
+                            logger.warning(
+                                "run stream close cancelled run_key=%s",
+                                run_key,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "run stream close failed run_key=%s",
+                                run_key,
+                            )
+
                     finish_time = datetime.now(timezone.utc)
                     if on_finished is not None:
                         try:

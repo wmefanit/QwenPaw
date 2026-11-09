@@ -129,6 +129,28 @@ async def test_stop_cancellation_is_propagated_after_siblings(async_stop):
 
 
 @pytest.mark.asyncio
+async def test_workspace_drains_run_tracker_before_stopping_services(workspace):
+    order = []
+
+    async def cancel_owner(owner):
+        assert owner is workspace
+        order.append("cancel_runs")
+        return True
+
+    async def stop_services(**kwargs):
+        order.append("stop_services")
+
+    workspace._task_tracker.cancel_owner = cancel_owner
+    workspace._service_manager.stop_all = stop_services
+    workspace._started = True
+
+    await workspace.stop()
+
+    assert order == ["cancel_runs", "stop_services"]
+    assert workspace._started is False
+
+
+@pytest.mark.asyncio
 async def test_stop_cancellation_does_not_commit_workspace_stopped(workspace):
     class CancelledMemory:
         async def close(self):
