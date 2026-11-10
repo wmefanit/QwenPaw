@@ -24,8 +24,8 @@ function stableJson(value: unknown): string {
 }
 
 /** Every queued item has an independently serializable message group. */
-export function isBatchable(_item: QueueItem): boolean {
-  return true;
+export function isBatchable(item: QueueItem): boolean {
+  return Boolean(item);
 }
 
 function hasSameRequestSemantics(
@@ -51,6 +51,45 @@ function hasSameRequestSemantics(
  * The caller normally passes the queue head; an explicitly retried item may
  * be elsewhere, but batching will still not jump over following queue entries.
  */
+export function selectPendingSteeringBatchAfterAccepted(
+  queue: QueueItem[],
+  agentId: string,
+  quantity: "one" | "all" = "all",
+): QueueItem[] {
+  let prefixLength = 0;
+  while (
+    prefixLength < queue.length &&
+    queue[prefixLength].status === "sending" &&
+    queue[prefixLength].steeringAccepted
+  ) {
+    prefixLength += 1;
+  }
+  const firstPending = queue[prefixLength];
+  const acceptedHead = queue[0];
+  if (
+    !acceptedHead ||
+    !firstPending ||
+    firstPending.status !== "pending" ||
+    !hasSameRequestSemantics(acceptedHead, firstPending, agentId)
+  )
+    return [];
+
+  const batch = [firstPending];
+  if (quantity === "one") return batch;
+  for (let index = prefixLength + 1; index < queue.length; index += 1) {
+    const candidate = queue[index];
+    if (
+      candidate.status !== "pending" ||
+      !isBatchable(candidate) ||
+      !hasSameRequestSemantics(acceptedHead, candidate, agentId) ||
+      !hasSameRequestSemantics(firstPending, candidate, agentId)
+    )
+      break;
+    batch.push(candidate);
+  }
+  return batch;
+}
+
 export function selectBatchItems(
   queue: QueueItem[],
   item: QueueItem,

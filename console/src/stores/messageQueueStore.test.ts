@@ -590,6 +590,89 @@ describe("messageQueueStore", () => {
     },
   );
 
+  it("persists steer intent before posting and atomically marks acceptance", () => {
+    const store = useMessageQueueStore.getState();
+    store.enqueue(SESSION_ID, { text: "first" });
+    store.enqueue(SESSION_ID, { text: "second" });
+    const ids = store.getQueue(SESSION_ID).map((item) => item.id);
+
+    store.beginSteering(SESSION_ID, ids);
+    expect(store.getQueue(SESSION_ID)).toMatchObject([
+      { status: "sending", steeringSubmitting: true },
+      { status: "sending", steeringSubmitting: true },
+    ]);
+    expect(
+      JSON.parse(localStorage.getItem(getStorageKey(SESSION_ID))!).items,
+    ).toMatchObject([
+      { status: "sending", steeringSubmitting: true },
+      { status: "sending", steeringSubmitting: true },
+    ]);
+
+    store.markSteeringAccepted(SESSION_ID, ids);
+    expect(store.getQueue(SESSION_ID)).toMatchObject([
+      { status: "sending", steeringSubmitting: false, steeringAccepted: true },
+      { status: "sending", steeringSubmitting: false, steeringAccepted: true },
+    ]);
+  });
+
+  it("restores an explicitly rejected steer batch to pending", () => {
+    const store = useMessageQueueStore.getState();
+    store.enqueue(SESSION_ID, { text: "first" });
+    store.enqueue(SESSION_ID, { text: "second" });
+    const ids = store.getQueue(SESSION_ID).map((item) => item.id);
+    store.setRunState(SESSION_ID, "running");
+    store.beginSteering(SESSION_ID, ids);
+    store.clearSteeringSubmitting(SESSION_ID, ids);
+
+    expect(store.getQueue(SESSION_ID)).toMatchObject([
+      { status: "pending", steeringSubmitting: false, steeringAccepted: false },
+      { status: "pending", steeringSubmitting: false, steeringAccepted: false },
+    ]);
+    expect(store.getRunState(SESSION_ID)).toBe("running");
+  });
+
+  it("recovers only unconsumed steer items after authoritative idle history is empty", () => {
+    const store = useMessageQueueStore.getState();
+    store.enqueue(SESSION_ID, { text: "accepted steer" });
+    store.enqueue(SESSION_ID, { text: "ordinary unknown" });
+    const [steer, ordinary] = store.getQueue(SESSION_ID);
+    store.beginSteering(SESSION_ID, [steer.id]);
+    store.setItemStatus(SESSION_ID, ordinary.id, "sending");
+
+    store.reconcileHistory(SESSION_ID, "default", []);
+    store.recoverUnconsumedSteering(SESSION_ID, [steer.id, ordinary.id]);
+
+    expect(store.getQueue(SESSION_ID)).toMatchObject([
+      {
+        id: steer.id,
+        text: "accepted steer",
+        status: "pending",
+        steeringSubmitting: false,
+      },
+      { id: ordinary.id, text: "ordinary unknown", status: "sending" },
+    ]);
+  });
+
+  it("reconciliation removes a consumed steer receipt instead of restoring it", () => {
+    const store = useMessageQueueStore.getState();
+    store.enqueue(SESSION_ID, { text: "already consumed" });
+    const [item] = store.getQueue(SESSION_ID);
+    store.beginSteering(SESSION_ID, [item.id]);
+    store.markSteeringAccepted(SESSION_ID, [item.id]);
+
+    store.reconcileHistory(SESSION_ID, "default", [
+      {
+        role: "user",
+        metadata: {
+          qwenpaw_client_message_id: item.clientMessageId,
+        },
+      },
+    ]);
+    store.recoverUnconsumedSteering(SESSION_ID, [item.id]);
+
+    expect(store.getQueue(SESSION_ID)).toEqual([]);
+  });
+
   it("setItemStatus to a non-failed status does not increment retryCount", () => {
     useMessageQueueStore.getState().enqueue(SESSION_ID, { text: "x" });
     const id = useMessageQueueStore.getState().getQueue(SESSION_ID)[0].id;

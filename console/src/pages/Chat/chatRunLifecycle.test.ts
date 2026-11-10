@@ -4,7 +4,10 @@ import { join } from "node:path";
 import ts from "typescript";
 import { ChatRunLifecycle } from "@agentscope-ai/chat/lib/AgentScopeRuntimeWebUI/core/Execution/runLifecycle";
 import { request } from "../../api/request";
-import { selectBatchItems } from "../../stores/batchSelection";
+import {
+  selectBatchItems,
+  selectPendingSteeringBatchAfterAccepted,
+} from "../../stores/batchSelection";
 import { extractUserMessageText } from "./utils";
 import { submitQueueSteering } from "./queueSteering";
 import {
@@ -16,6 +19,7 @@ import {
   awaitInChatScope,
   awaitQueueAcceptance,
   recoverSendingQueueHead,
+  reconcileQueueReceipts,
   waitForChatIdle,
 } from "./chatRunLifecycle";
 import {
@@ -141,7 +145,7 @@ const backgroundWorkerJS = ts.transpileModule(workerFunctions.join("\n"), {
   },
 }).outputText;
 
-function backgroundWorkerFixture() {
+function backgroundWorkerFixture(overrides: Record<string, unknown> = {}) {
   const sessionApi = {
     setLastUserMessage: vi.fn(),
     discardLastUserMessage: vi.fn(),
@@ -152,7 +156,9 @@ function backgroundWorkerFixture() {
     awaitInChatScope,
     waitForChatIdle,
     recoverSendingQueueHead,
+    reconcileQueueReceipts,
     selectBatchItems,
+    selectPendingSteeringBatchAfterAccepted,
     extractUserMessageText,
     submitQueueSteering,
     stopBackgroundQueue,
@@ -171,10 +177,11 @@ function backgroundWorkerFixture() {
     DEFAULT_USER_ID: "default",
     DEFAULT_CHANNEL: "console",
   };
+  const injected = { ...dependencies, ...overrides };
   const start = new Function(
-    ...Object.keys(dependencies),
+    ...Object.keys(injected),
     `${backgroundWorkerJS}\nreturn startBackgroundQueue;`,
-  )(...Object.values(dependencies)) as (
+  )(...Object.values(injected)) as (
     queueKey: string,
     backendSessionId: string,
     chatId: string,
@@ -228,6 +235,10 @@ describe("background queue transport handoff", () => {
   afterEach(async () => {
     stopBackgroundQueue();
     finishFixtures.forEach((finish) => finish());
+    if (vi.isFakeTimers()) {
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+    }
     await Promise.allSettled(workers);
   });
 
@@ -318,6 +329,160 @@ describe("background queue transport handoff", () => {
     expect(fetchFixture).toHaveBeenCalledTimes(1);
   });
 
+  it("appends a later background queue item after an earlier steer was accepted", async () => {
+    useMessageQueueStore.getState().clear(key);
+    useMessageQueueStore.getState().setSendOptions(key, {
+      timing: "before_next_request",
+      quantity: "all",
+    });
+    useMessageQueueStore.getState().enqueue(key, {
+      text: "first-steer",
+      agentId: "agent-a",
+      backendSessionId: "runtime-a",
+    });
+    const first = useMessageQueueStore.getState().getQueue(key)[0];
+    let appended = false;
+    const waitForChatIdleMock = vi.fn(async () => true);
+    const submissions: string[][] = [];
+    const submitSteeringMock = vi.fn(
+      async (
+        _chatId: string,
+        _agent: string,
+        input: Array<Record<string, unknown>>,
+      ) => {
+        submissions.push(
+          input.map((message) => {
+            const content = message.content as Array<{ text?: string }>;
+            return content.find((part) => part.text)?.text ?? "";
+          }),
+        );
+        return "accepted" as const;
+      },
+    );
+    const reconcileMock = vi.fn(async () => {
+      if (!appended) {
+        appended = true;
+        useMessageQueueStore.getState().enqueue(key, {
+          text: "late-steer",
+          agentId: "agent-a",
+          backendSessionId: "runtime-a",
+        });
+      }
+      return "running" as const;
+    });
+    vi.useFakeTimers();
+    const fixture = backgroundWorkerFixture({
+      waitForChatIdle: waitForChatIdleMock,
+      submitQueueSteering: submitSteeringMock,
+      reconcileQueueReceipts: reconcileMock,
+    });
+    const worker = fixture.start(key, "runtime-a", key);
+    workers.push(worker);
+    await vi.waitFor(
+      async () => {
+        if (reconcileMock.mock.calls.length > 0) {
+          await vi.advanceTimersByTimeAsync(1000);
+        }
+        if (submissions.length !== 2) {
+          throw new Error(
+            `submissions=${JSON.stringify(submissions)} queue=${JSON.stringify(
+              useMessageQueueStore
+                .getState()
+                .getQueue(key)
+                .map(({ text, status, steeringAccepted }) => ({
+                  text,
+                  status,
+                  steeringAccepted,
+                })),
+            )} reconcile=${reconcileMock.mock.calls.length} idle=${
+              waitForChatIdleMock.mock.calls.length
+            }`,
+          );
+        }
+      },
+      { timeout: 5000 },
+    );
+    expect(submissions).toEqual([["first-steer"], ["late-steer"]]);
+    expect(useMessageQueueStore.getState().getQueue(key)).toMatchObject([
+      { id: first.id, status: "sending", steeringAccepted: true },
+      { text: "late-steer", status: "sending", steeringAccepted: true },
+    ]);
+    stopBackgroundQueue(key);
+    await vi.waitFor(() => expect(held.size).toBe(0));
+    expect(reconcileMock).toHaveBeenCalled();
+  });
+
+  it("falls an unknown steer result back to one normal send after idle history confirms no receipt", async () => {
+    useMessageQueueStore.getState().clear(key);
+    useMessageQueueStore.getState().setSendOptions(key, {
+      timing: "before_next_request",
+      quantity: "all",
+    });
+    useMessageQueueStore.getState().enqueue(key, {
+      text: "deliver exactly once",
+      agentId: "agent-a",
+      backendSessionId: "runtime-a",
+    });
+    const original = useMessageQueueStore.getState().getQueue(key)[0];
+    const submitSteeringMock = vi.fn(async () => {
+      throw new Error("connection lost after request dispatch");
+    });
+    const fetchFixture = vi.fn<typeof fetch>(
+      async () => new Response(null, { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchFixture);
+    vi.mocked(request).mockResolvedValue({ status: "idle", messages: [] });
+    vi.useFakeTimers();
+
+    const fixture = backgroundWorkerFixture({
+      submitQueueSteering: submitSteeringMock,
+    });
+    const worker = fixture.start(key, "runtime-a", key);
+    workers.push(worker);
+
+    await vi.waitFor(
+      async () => {
+        if (submitSteeringMock.mock.calls.length > 0) {
+          await vi.advanceTimersByTimeAsync(1000);
+        }
+        if (fetchFixture.mock.calls.length !== 1) {
+          throw new Error(
+            `fetch=${fetchFixture.mock.calls.length} steering=${
+              submitSteeringMock.mock.calls.length
+            } queue=${JSON.stringify(
+              useMessageQueueStore
+                .getState()
+                .getQueue(key)
+                .map((item) => ({
+                  text: item.text,
+                  status: item.status,
+                  steeringSubmitting: item.steeringSubmitting,
+                  steeringAccepted: item.steeringAccepted,
+                  steeringWindowClosed: item.steeringWindowClosed,
+                })),
+            )} requests=${JSON.stringify(
+              vi.mocked(request).mock.results.map((result) => result.type),
+            )}`,
+          );
+        }
+      },
+      { timeout: 5000 },
+    );
+    await worker;
+
+    expect(submitSteeringMock).toHaveBeenCalledTimes(1);
+    expect(fetchFixture).toHaveBeenCalledTimes(1);
+    const posted = JSON.parse(String(fetchFixture.mock.calls[0][1]?.body));
+    expect(posted.input[0].metadata.qwenpaw_client_message_id).toBe(
+      original.clientMessageId,
+    );
+    expect(posted.input[0].content).toEqual([
+      expect.objectContaining({ text: "deliver exactly once" }),
+    ]);
+    expect(useMessageQueueStore.getState().getQueue(key)).toEqual([]);
+    expect(useMessageQueueStore.getState().getRunState(key)).toBe("idle");
+  });
+
   it("retains an actual pre-acceptance HTTP failure as failed", async () => {
     vi.stubGlobal(
       "fetch",
@@ -406,6 +571,90 @@ describe("queue Run handoff", () => {
   });
 });
 describe("persisted sending recovery", () => {
+  it("falls back an accepted steer to pending only after idle history has no receipt", async () => {
+    const store = useMessageQueueStore.getState();
+    store.enqueue(key, {
+      text: "accepted but not consumed",
+      agentId: "agent-a",
+    });
+    const item = store.getQueue(key)[0];
+    store.beginSteering(key, [item.id]);
+    store.markSteeringAccepted(key, [item.id]);
+    vi.mocked(request).mockResolvedValue({ status: "idle", messages: [] });
+
+    await recoverSendingQueueHead(
+      key,
+      new AbortController().signal,
+      "agent-a",
+      key,
+      "retry required",
+    );
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(store.getQueue(key)).toMatchObject([
+      {
+        id: item.id,
+        clientMessageId: item.clientMessageId,
+        text: "accepted but not consumed",
+        status: "pending",
+        steeringSubmitting: false,
+        steeringAccepted: false,
+      },
+    ]);
+    expect(store.getRunState(key)).toBe("idle");
+  });
+
+  it("removes a consumed steer receipt instead of falling it back to pending", async () => {
+    const store = useMessageQueueStore.getState();
+    store.enqueue(key, { text: "already consumed", agentId: "agent-a" });
+    const item = store.getQueue(key)[0];
+    store.beginSteering(key, [item.id]);
+    store.markSteeringAccepted(key, [item.id]);
+    vi.mocked(request).mockResolvedValue({
+      status: "idle",
+      messages: [
+        {
+          role: "user",
+          metadata: { qwenpaw_client_message_id: item.clientMessageId },
+        },
+      ],
+    });
+
+    await recoverSendingQueueHead(
+      key,
+      new AbortController().signal,
+      "agent-a",
+      key,
+      "retry required",
+    );
+
+    expect(store.getQueue(key)).toEqual([]);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fall back when the backend status/history cannot be confirmed", async () => {
+    const store = useMessageQueueStore.getState();
+    store.enqueue(key, {
+      text: "still in flight",
+      agentId: "agent-a",
+    });
+    const item = store.getQueue(key)[0];
+    store.beginSteering(key, [item.id]);
+    store.markSteeringAccepted(key, [item.id]);
+    vi.mocked(request).mockRejectedValue(new Error("history unavailable"));
+
+    await recoverSendingQueueHead(
+      key,
+      new AbortController().signal,
+      "agent-a",
+      key,
+      "retry required",
+    );
+    expect(store.getQueue(key)[0]).toMatchObject({
+      status: "sending",
+      steeringAccepted: true,
+    });
+  });
   it("removes a confirmed receipt after reload and preserves the next queued task", async () => {
     const head = sendingHead();
     useMessageQueueStore.setState({ queues: {}, runStates: {} });

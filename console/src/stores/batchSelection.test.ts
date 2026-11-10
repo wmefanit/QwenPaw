@@ -3,7 +3,11 @@
  * semantics may travel in one turn.
  */
 import { describe, expect, it } from "vitest";
-import { isBatchable, selectBatchItems } from "./batchSelection";
+import {
+  isBatchable,
+  selectBatchItems,
+  selectPendingSteeringBatchAfterAccepted,
+} from "./batchSelection";
 import type { QueueItem } from "./messageQueueStore";
 
 function makeItem(overrides: Partial<QueueItem> = {}): QueueItem {
@@ -31,8 +35,67 @@ describe("isBatchable", () => {
     ["images", { images: [{ path: "/tmp/a.png" } as never] }],
     ["mentions", { mentions: [{ id: "user-1" } as never] }],
     ["quotes", { quote: { text: "quoted" } as never }],
-  ])("accepts an item with %s as an independent message group", (_label, overrides) => {
-    expect(isBatchable(makeItem(overrides))).toBe(true);
+  ])(
+    "accepts an item with %s as an independent message group",
+    (_label, overrides) => {
+      expect(isBatchable(makeItem(overrides))).toBe(true);
+    },
+  );
+});
+
+describe("selectPendingSteeringBatchAfterAccepted", () => {
+  it("selects only the compatible pending suffix after an accepted steer", () => {
+    const queue = [
+      makeItem({ id: "accepted-1", status: "sending", steeringAccepted: true }),
+      makeItem({ id: "accepted-2", status: "sending", steeringAccepted: true }),
+      makeItem({ id: "late-1" }),
+      makeItem({ id: "late-2" }),
+    ];
+    expect(
+      selectPendingSteeringBatchAfterAccepted(queue, "agent-a").map(
+        (item) => item.id,
+      ),
+    ).toEqual(["late-1", "late-2"]);
+  });
+
+  it("preserves request-context and quantity boundaries for appended steering", () => {
+    const queue = [
+      makeItem({ id: "accepted", status: "sending", steeringAccepted: true }),
+      makeItem({ id: "late-1" }),
+      makeItem({
+        id: "different-context",
+        requestContext: { approval_level: "STRICT" },
+      }),
+      makeItem({ id: "late-3" }),
+    ];
+    expect(
+      selectPendingSteeringBatchAfterAccepted(queue, "agent-a", "all").map(
+        (item) => item.id,
+      ),
+    ).toEqual(["late-1"]);
+    expect(
+      selectPendingSteeringBatchAfterAccepted(queue, "agent-a", "one").map(
+        (item) => item.id,
+      ),
+    ).toEqual(["late-1"]);
+  });
+
+  it("does not cross a failed item, routing boundary, or mismatched accepted prefix", () => {
+    const accepted = makeItem({
+      id: "accepted",
+      status: "sending",
+      steeringAccepted: true,
+    });
+    const pending = makeItem({ id: "late", agentId: "agent-b" });
+    expect(
+      selectPendingSteeringBatchAfterAccepted([accepted, pending], "agent-a"),
+    ).toEqual([]);
+    expect(
+      selectPendingSteeringBatchAfterAccepted(
+        [accepted, makeItem({ id: "failed", status: "failed" }), pending],
+        "agent-a",
+      ),
+    ).toEqual([]);
   });
 });
 
@@ -56,9 +119,11 @@ describe("selectBatchItems", () => {
       makeItem({ id: "c" }),
     ];
 
-    expect(selectBatchItems(queue, queue[0], "agent-a", "one").map((item) => item.id)).toEqual([
-      "a",
-    ]);
+    expect(
+      selectBatchItems(queue, queue[0], "agent-a", "one").map(
+        (item) => item.id,
+      ),
+    ).toEqual(["a"]);
   });
 
   it.each([
