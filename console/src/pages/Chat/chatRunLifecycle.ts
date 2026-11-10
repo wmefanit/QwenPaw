@@ -58,6 +58,25 @@ function waitForPoll(signal: AbortSignal): Promise<void> {
   });
 }
 
+/** Reconcile accepted queue receipts without waiting for the active run to end. */
+export async function reconcileQueueReceipts(
+  chatId: string,
+  signal: AbortSignal,
+  agentId: string,
+  queueKey = chatId,
+): Promise<"idle" | "running"> {
+  const chat = await request<ChatHistory>(
+    `/chats/${encodeURIComponent(chatId)}`,
+    { headers: { "X-Agent-Id": agentId }, signal },
+  );
+  if (signal.aborted) return "running";
+  useMessageQueueStore
+    .getState()
+    .reconcileHistory(queueKey, agentId, chat.messages || []);
+  if (chat.status === "idle" || chat.status === "running") return chat.status;
+  throw new Error("Unable to confirm chat status");
+}
+
 /** Only an explicit backend idle state permits a subsequent queued turn. */
 export async function waitForChatIdle(
   chatId: string,
@@ -109,8 +128,9 @@ export async function recoverSendingQueueHead(
   );
   const head = sendingBatch[0];
   if (!head) return;
+  let confirmedIdle = false;
   try {
-    if (!(await waitForChatIdle(chatId, signal, agentId, queueKey))) return;
+    confirmedIdle = await waitForChatIdle(chatId, signal, agentId, queueKey);
   } catch (error) {
     if (signal.aborted) return;
     if (error instanceof Error) errorMessage = error.message;
@@ -118,9 +138,40 @@ export async function recoverSendingQueueHead(
   const state = useMessageQueueStore.getState();
   if (signal.aborted || state.getRunState(queueKey) === "paused") return;
 
-  // waitForChatIdle reconciles persisted receipts and removes confirmed items.
-  // Any contiguous sending items still present have unknown receipts and must
-  // become explicitly retryable instead of remaining stuck behind the head.
+  // A status/history error is not evidence of non-delivery. Keep all steer
+  // markers untouched until an authoritative idle response is available.
+  if (!confirmedIdle) {
+    const hasSteerIntent = sendingBatch.some((sentItem) => {
+      const current = useMessageQueueStore
+        .getState()
+        .getQueue(queueKey)
+        .find((item) => item.id === sentItem.id);
+      return Boolean(current?.steeringAccepted || current?.steeringSubmitting);
+    });
+    if (hasSteerIntent) return;
+  }
+
+  // waitForChatIdle has now established an authoritative idle state and
+  // reconciled history. Items with durable receipts are already removed; only
+  // steer requests explicitly marked accepted/submitting may safely fall back
+  // to normal queued delivery when their receipt is absent.
+  const recoverableSteering = sendingBatch.filter((sentItem) => {
+    const current = useMessageQueueStore
+      .getState()
+      .getQueue(queueKey)
+      .find((item) => item.id === sentItem.id);
+    return (
+      current?.status === "sending" &&
+      Boolean(current.steeringAccepted || current.steeringSubmitting)
+    );
+  });
+  useMessageQueueStore.getState().recoverUnconsumedSteering(
+    queueKey,
+    recoverableSteering.map((item) => item.id),
+  );
+
+  // Remaining sending items have unknown ordinary-send receipts and must stay
+  // explicitly retryable instead of being blindly resent or stuck forever.
   for (const sentItem of sendingBatch) {
     const current = useMessageQueueStore
       .getState()

@@ -77,6 +77,12 @@ export interface QueueItem {
   requestContext?: Record<string, unknown>;
   bizParams?: Record<string, unknown>;
   status: QueueItemStatus;
+  /** A next-request steer request is in flight or its HTTP result is unknown. */
+  steeringSubmitting?: boolean;
+  /** The backend accepted this item, awaiting durable chat-history receipt. */
+  steeringAccepted?: boolean;
+  /** The model-request window closed before a later queued item was accepted. */
+  steeringWindowClosed?: boolean;
   retryCount: number;
   errorMessage?: string;
   createdAt: number;
@@ -518,6 +524,11 @@ interface MessageQueueStore {
     status: QueueItemStatus,
     errorMessage?: string,
   ) => void;
+  beginSteering: (sessionId: string, ids: string[]) => void;
+  markSteeringAccepted: (sessionId: string, ids: string[]) => void;
+  clearSteeringSubmitting: (sessionId: string, ids: string[]) => void;
+  markSteeringWindowClosed: (sessionId: string, ids: string[]) => void;
+  recoverUnconsumedSteering: (sessionId: string, ids: string[]) => void;
   /** Set run state for a specific session (persists to localStorage). */
   setRunState: (sessionId: string, state: QueueRunState) => void;
   /** Get run state for a specific session (defaults to "idle"). */
@@ -761,6 +772,10 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
           ? {
               ...it,
               status,
+              steeringAccepted:
+                status === "sending" ? it.steeringAccepted : false,
+              steeringSubmitting:
+                status === "sending" ? it.steeringSubmitting : false,
               errorMessage,
               retryCount: it.retryCount + (status === "failed" ? 1 : 0),
             }
@@ -778,6 +793,155 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
         runState,
       });
       return { queues: next, runStates };
+    });
+  },
+
+  beginSteering: (sessionId, ids) => {
+    const idSet = new Set(ids);
+    set((state) => {
+      const current = state.queues[sessionId] ?? [];
+      const nextItems = current.map((item) =>
+        idSet.has(item.id) && item.status === "pending"
+          ? {
+              ...item,
+              status: "sending" as const,
+              steeringSubmitting: true,
+              steeringAccepted: false,
+              steeringWindowClosed: false,
+              errorMessage: undefined,
+            }
+          : item,
+      );
+      const queues = { ...state.queues, [sessionId]: nextItems };
+      const runState = state.runStates[sessionId] ?? "idle";
+      writeQueueToStorage(sessionId, nextItems, runState);
+      broadcast({
+        type: "setItemStatus",
+        sessionId,
+        items: nextItems,
+        runState,
+      });
+      return { queues };
+    });
+  },
+
+  markSteeringAccepted: (sessionId, ids) => {
+    const idSet = new Set(ids);
+    set((state) => {
+      const current = state.queues[sessionId] ?? [];
+      const nextItems = current.map((item) =>
+        idSet.has(item.id) && item.status === "sending"
+          ? {
+              ...item,
+              steeringSubmitting: false,
+              steeringAccepted: true,
+              steeringWindowClosed: false,
+            }
+          : item,
+      );
+      const queues = { ...state.queues, [sessionId]: nextItems };
+      const runState = state.runStates[sessionId] ?? "idle";
+      writeQueueToStorage(sessionId, nextItems, runState);
+      broadcast({
+        type: "setItemStatus",
+        sessionId,
+        items: nextItems,
+        runState,
+      });
+      return { queues };
+    });
+  },
+
+  clearSteeringSubmitting: (sessionId, ids) => {
+    const idSet = new Set(ids);
+    set((state) => {
+      const current = state.queues[sessionId] ?? [];
+      const nextItems = current.map((item) =>
+        idSet.has(item.id) && item.status === "sending"
+          ? {
+              ...item,
+              status: "pending" as const,
+              steeringSubmitting: false,
+              steeringAccepted: false,
+              steeringWindowClosed: true,
+              errorMessage: undefined,
+            }
+          : item,
+      );
+      const runState: QueueRunState = nextItems.some(
+        (item) => item.status === "failed",
+      )
+        ? "error"
+        : state.runStates[sessionId] ?? "idle";
+      const runStates = { ...state.runStates, [sessionId]: runState };
+      const queues = { ...state.queues, [sessionId]: nextItems };
+      writeQueueToStorage(sessionId, nextItems, runState);
+      broadcast({
+        type: "setItemStatus",
+        sessionId,
+        items: nextItems,
+        runState,
+      });
+      return { queues, runStates };
+    });
+  },
+
+  recoverUnconsumedSteering: (sessionId, ids) => {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
+    set((state) => {
+      const current = state.queues[sessionId] ?? [];
+      const nextItems = current.map((item) =>
+        idSet.has(item.id) &&
+        item.status === "sending" &&
+        (item.steeringAccepted || item.steeringSubmitting)
+          ? {
+              ...item,
+              status: "pending" as const,
+              steeringSubmitting: false,
+              steeringAccepted: false,
+              steeringWindowClosed: true,
+              errorMessage: undefined,
+            }
+          : item,
+      );
+      const runState: QueueRunState = nextItems.some(
+        (item) => item.status === "failed",
+      )
+        ? "error"
+        : state.runStates[sessionId] ?? "idle";
+      const runStates = { ...state.runStates, [sessionId]: runState };
+      const queues = { ...state.queues, [sessionId]: nextItems };
+      writeQueueToStorage(sessionId, nextItems, runState);
+      broadcast({
+        type: "setItemStatus",
+        sessionId,
+        items: nextItems,
+        runState,
+      });
+      return { queues, runStates };
+    });
+  },
+
+  markSteeringWindowClosed: (sessionId, ids) => {
+    const idSet = new Set(ids);
+    set((state) => {
+      const current = state.queues[sessionId] ?? [];
+      const nextItems = current.map((item) =>
+        idSet.has(item.id) && item.steeringAccepted
+          ? { ...item, steeringWindowClosed: true }
+          : item,
+      );
+      const queues = { ...state.queues, [sessionId]: nextItems };
+      const runState = state.runStates[sessionId] ?? "idle";
+      writeQueueToStorage(sessionId, nextItems, runState);
+      broadcast({
+        type: "setItemStatus",
+        sessionId,
+        items: nextItems,
+        runState,
+      });
+      return { queues };
     });
   },
 
@@ -820,16 +984,40 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
         .map((message) => extractClientMessageId(message.metadata))
         .filter(Boolean),
     );
-    if (received.size === 0) return;
     const saved = readQueueFromStorage(sessionId);
     const current = get().queues[sessionId] ?? saved?.items ?? [];
-    const items = current.filter(
-      (item) =>
-        (item.agentId || "default") !== agentId ||
-        !item.clientMessageId ||
-        !received.has(item.clientMessageId),
-    );
-    if (items.length === current.length) return;
+    const items = current
+      .filter(
+        (item) =>
+          (item.agentId || "default") !== agentId ||
+          !item.clientMessageId ||
+          !received.has(item.clientMessageId),
+      )
+      .map((item) =>
+        (item.agentId || "default") === agentId &&
+        item.clientMessageId &&
+        received.has(item.clientMessageId)
+          ? {
+              ...item,
+              steeringSubmitting: false,
+              steeringAccepted: false,
+              steeringWindowClosed: false,
+            }
+          : item,
+      );
+    if (
+      items.length === current.length &&
+      !current.some(
+        (item) =>
+          (item.agentId || "default") === agentId &&
+          item.clientMessageId &&
+          received.has(item.clientMessageId) &&
+          (item.steeringSubmitting ||
+            item.steeringAccepted ||
+            item.steeringWindowClosed),
+      )
+    )
+      return;
     const previous = get().runStates[sessionId] ?? saved?.runState ?? "idle";
     const runState =
       previous === "error" && !items.some((item) => item.status === "failed")
@@ -997,10 +1185,7 @@ if (typeof window !== "undefined") {
     if (suffix.startsWith("options:")) {
       const sessionId = suffix.slice("options:".length);
       const store = useMessageQueueStore.getState();
-      store.applyRemoteSendOptions(
-        sessionId,
-        readSendOptions(sessionId),
-      );
+      store.applyRemoteSendOptions(sessionId, readSendOptions(sessionId));
       return;
     }
     const sessionId = suffix;

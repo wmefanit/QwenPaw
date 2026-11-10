@@ -130,6 +130,7 @@ import {
   awaitInChatScope,
   awaitQueueAcceptance,
   recoverSendingQueueHead,
+  reconcileQueueReceipts,
   waitForChatIdle,
 } from "./chatRunLifecycle";
 import {
@@ -286,7 +287,10 @@ import {
   withBackgroundSendLock,
   holdOwnershipLock,
 } from "../../stores/messageQueueStore";
-import { selectBatchItems } from "../../stores/batchSelection";
+import {
+  selectBatchItems,
+  selectPendingSteeringBatchAfterAccepted,
+} from "../../stores/batchSelection";
 import { submitQueueSteering } from "./queueSteering";
 import {
   requiresQwenPawModel,
@@ -494,23 +498,61 @@ async function startBackgroundQueue(
         const sendOptions = useMessageQueueStore
           .getState()
           .getSendOptions(queueKey);
-        if (
-          sendOptions.timing === "before_next_request" &&
-          waitingItem.status === "pending" &&
-          chatIdForStatus
-        ) {
-          const steeringBatch = selectBatchItems(
-            current,
-            waitingItem,
-            waitingItem.agentId || "default",
-            sendOptions.quantity,
-          );
-          const steeringMessages = buildQueueBatchGroups(steeringBatch);
-          for (const entry of steeringBatch) {
-            useMessageQueueStore
-              .getState()
-              .setItemStatus(queueKey, entry.id, "sending");
+        const agentId = waitingItem.agentId || "default";
+        const hasSteeringIntent =
+          waitingItem.status === "sending" &&
+          (waitingItem.steeringAccepted || waitingItem.steeringSubmitting);
+        const canAppendAfterAccepted =
+          waitingItem.status === "sending" &&
+          waitingItem.steeringAccepted === true &&
+          !waitingItem.steeringWindowClosed;
+        const steeringBatch =
+          sendOptions.timing === "before_next_request" && chatIdForStatus
+            ? waitingItem.status === "pending" &&
+              !waitingItem.steeringWindowClosed
+              ? selectBatchItems(
+                  current,
+                  waitingItem,
+                  agentId,
+                  sendOptions.quantity,
+                )
+              : canAppendAfterAccepted
+              ? selectPendingSteeringBatchAfterAccepted(
+                  current,
+                  agentId,
+                  sendOptions.quantity,
+                )
+              : []
+            : [];
+        if (hasSteeringIntent && steeringBatch.length === 0) {
+          try {
+            const status = await reconcileQueueReceipts(
+              chatIdForStatus,
+              ctrl.signal,
+              agentId,
+              queueKey,
+            );
+            if (status === "idle") {
+              await recoverSendingQueueHead(
+                chatIdForStatus,
+                ctrl.signal,
+                agentId,
+                queueKey,
+                i18n.t("chat.queue.sendFailed"),
+              );
+              return true;
+            }
+          } catch {
+            // Keep accepted messages recoverable; transient history failures
+            // are not proof that the queued message was rejected.
           }
+          await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+          return !ctrl.signal.aborted;
+        }
+        if (steeringBatch.length > 0) {
+          const steeringMessages = buildQueueBatchGroups(steeringBatch);
+          const steeringIds = steeringBatch.map((entry) => entry.id);
+          useMessageQueueStore.getState().beginSteering(queueKey, steeringIds);
           try {
             const result = await submitQueueSteering(
               chatIdForStatus,
@@ -519,30 +561,30 @@ async function startBackgroundQueue(
               ctrl.signal,
             );
             if (result === "accepted") {
-              // Keep local receipts in `sending` until backend history
-              // confirms injection; recovery will reconcile after run idle.
+              useMessageQueueStore.getState().markSteeringAccepted(
+                queueKey,
+                steeringBatch.map((entry) => entry.id),
+              );
               return true;
             }
-            for (const entry of steeringBatch) {
-              useMessageQueueStore
-                .getState()
-                .setItemStatus(queueKey, entry.id, "pending");
+            useMessageQueueStore
+              .getState()
+              .clearSteeringSubmitting(queueKey, steeringIds);
+            if (canAppendAfterAccepted) {
+              useMessageQueueStore.getState().markSteeringWindowClosed(
+                queueKey,
+                current
+                  .filter((entry) => entry.steeringAccepted)
+                  .map((entry) => entry.id),
+              );
+              return true;
             }
-          } catch (error) {
+          } catch {
+            // Keep the persisted submitting marker: a network error or abort
+            // cannot prove that the backend rejected the steering request.
             if (ctrl.signal.aborted) return false;
-            for (const entry of steeringBatch) {
-              useMessageQueueStore
-                .getState()
-                .setItemStatus(
-                  queueKey,
-                  entry.id,
-                  "failed",
-                  error instanceof Error
-                    ? error.message
-                    : i18n.t("chat.queue.sendFailed"),
-                );
-            }
-            return false;
+            await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+            return !ctrl.signal.aborted;
           }
         }
 
@@ -1660,7 +1702,7 @@ export default function ChatPage() {
   const autoSendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const queueRunState = useMessageQueueStore((s) => s.runStates[queueKey]);
   const queueSendOptions = useMessageQueueStore(
-    (s) => s.sendOptions[queueKey] ?? DEFAULT_QUEUE_SEND_OPTIONS,
+    (s) => s.sendOptions?.[queueKey] ?? DEFAULT_QUEUE_SEND_OPTIONS,
   );
 
   const sessionApprovalLevelRef = useRef<ToolExecutionLevel | null>(null);
@@ -1752,27 +1794,44 @@ export default function ChatPage() {
       const execution = chatRef.current?.execution;
       if (!initialQueueId || !execution) return false;
 
+      const initialQueue = useMessageQueueStore
+        .getState()
+        .getQueue(initialQueueId);
       const agentId = item.agentId || selectedAgent;
       const queueOptions = useMessageQueueStore
         .getState()
         .getSendOptions(initialQueueId);
-      if (
+      const acceptedHead =
+        initialQueue[0]?.id === item.id &&
+        item.status === "sending" &&
+        item.steeringAccepted === true;
+      const acceptedWindowClosed =
+        acceptedHead && item.steeringWindowClosed === true;
+      const steeringBatch =
         queueOptions.timing === "before_next_request" &&
-        item.status === "pending" &&
         queueSessionId !== "new"
-      ) {
-        const steeringBatch = selectBatchItems(
-          useMessageQueueStore.getState().getQueue(initialQueueId),
-          item,
-          agentId,
-          queueOptions.quantity,
-        );
+          ? item.status === "pending" && !item.steeringWindowClosed
+            ? selectBatchItems(
+                initialQueue,
+                item,
+                agentId,
+                queueOptions.quantity,
+              )
+            : acceptedHead && !acceptedWindowClosed
+            ? selectPendingSteeringBatchAfterAccepted(
+                initialQueue,
+                agentId,
+                queueOptions.quantity,
+              )
+            : []
+          : [];
+      if (acceptedHead && steeringBatch.length === 0) return false;
+      if (steeringBatch.length > 0) {
         const steeringMessages = buildQueueBatchGroups(steeringBatch);
-        for (const entry of steeringBatch) {
-          useMessageQueueStore
-            .getState()
-            .setItemStatus(initialQueueId, entry.id, "sending");
-        }
+        const steeringIds = steeringBatch.map((entry) => entry.id);
+        useMessageQueueStore
+          .getState()
+          .beginSteering(initialQueueId, steeringIds);
         try {
           const steeringResult = await submitQueueSteering(
             sessionApi.getRealIdForSession(queueSessionId) || queueSessionId,
@@ -1781,28 +1840,28 @@ export default function ChatPage() {
             signal,
           );
           if (steeringResult === "accepted") {
+            useMessageQueueStore.getState().markSteeringAccepted(
+              initialQueueId,
+              steeringBatch.map((entry) => entry.id),
+            );
             useMessageQueueStore.getState().setCurrentSendingId(item.id);
             return true;
           }
-          for (const entry of steeringBatch) {
-            useMessageQueueStore
-              .getState()
-              .setItemStatus(initialQueueId, entry.id, "pending");
+          useMessageQueueStore
+            .getState()
+            .clearSteeringSubmitting(initialQueueId, steeringIds);
+          if (acceptedHead) {
+            useMessageQueueStore.getState().markSteeringWindowClosed(
+              initialQueueId,
+              initialQueue
+                .filter((entry) => entry.steeringAccepted)
+                .map((entry) => entry.id),
+            );
+            return false;
           }
-        } catch (error) {
-          if (signal.aborted) return false;
-          for (const entry of steeringBatch) {
-            useMessageQueueStore
-              .getState()
-              .setItemStatus(
-                initialQueueId,
-                entry.id,
-                "failed",
-                error instanceof Error
-                  ? error.message
-                  : i18n.t("chat.queue.sendFailed"),
-              );
-          }
+        } catch {
+          // The backend may have accepted the steer even if this request was
+          // interrupted. Keep its persisted marker for idle/history recovery.
           return false;
         }
       }
@@ -2153,13 +2212,109 @@ export default function ChatPage() {
       void withSendLock(queueKey, async () => {
         const signal = queueExecutionScopeRef.current.signal;
         if (queueKeyRef.current !== queueKey || signal.aborted) return;
-        await recoverSendingQueueHead(
-          sessionApi.getRealIdForSession(queueSessionId) || queueSessionId,
-          signal,
-          next.agentId || selectedAgent,
-          queueKey,
-          i18n.t("chat.queue.sendFailed"),
-        );
+        const initialQueue = useMessageQueueStore.getState().getQueue(queueKey);
+        const initialHead = initialQueue[0];
+        const sendOptions = useMessageQueueStore
+          .getState()
+          .getSendOptions(queueKey);
+        const hasSteeringIntent =
+          initialHead?.status === "sending" &&
+          (initialHead.steeringAccepted || initialHead.steeringSubmitting);
+        const acceptedHead =
+          initialHead?.status === "sending" &&
+          initialHead.steeringAccepted === true;
+        const pendingSteeringBatch = acceptedHead
+          ? selectPendingSteeringBatchAfterAccepted(
+              initialQueue,
+              initialHead.agentId || selectedAgent,
+              sendOptions.quantity,
+            )
+          : [];
+        const canAppendSteering =
+          sendOptions.timing === "before_next_request" &&
+          !initialHead?.steeringWindowClosed &&
+          pendingSteeringBatch.length > 0;
+
+        if (hasSteeringIntent && !canAppendSteering) {
+          try {
+            const status = await reconcileQueueReceipts(
+              sessionApi.getRealIdForSession(queueSessionId) || queueSessionId,
+              signal,
+              initialHead.agentId || selectedAgent,
+              queueKey,
+            );
+            if (status === "running") {
+              const stillAccepted = useMessageQueueStore
+                .getState()
+                .getQueue(queueKey)
+                .some(
+                  (item) => item.steeringAccepted || item.steeringSubmitting,
+                );
+              if (stillAccepted) {
+                window.setTimeout(scheduleNextSend, 3000);
+              }
+              return;
+            }
+            await recoverSendingQueueHead(
+              sessionApi.getRealIdForSession(queueSessionId) || queueSessionId,
+              signal,
+              initialHead.agentId || selectedAgent,
+              queueKey,
+              i18n.t("chat.queue.sendFailed"),
+            );
+          } catch {
+            // A status/history read failure is not evidence of an unknown or
+            // failed user send. Keep the accepted item and retry reconciliation.
+            window.setTimeout(scheduleNextSend, 3000);
+            return;
+          }
+        }
+        if (canAppendSteering) {
+          const steeringMessages = buildQueueBatchGroups(pendingSteeringBatch);
+          const steeringIds = pendingSteeringBatch.map((entry) => entry.id);
+          useMessageQueueStore.getState().beginSteering(queueKey, steeringIds);
+          try {
+            const result = await submitQueueSteering(
+              sessionApi.getRealIdForSession(queueSessionId) || queueSessionId,
+              initialHead.agentId || selectedAgent,
+              steeringMessages,
+              signal,
+            );
+            if (result === "accepted") {
+              useMessageQueueStore.getState().markSteeringAccepted(
+                queueKey,
+                pendingSteeringBatch.map((entry) => entry.id),
+              );
+              return;
+            }
+            useMessageQueueStore
+              .getState()
+              .clearSteeringSubmitting(queueKey, steeringIds);
+            useMessageQueueStore.getState().markSteeringWindowClosed(
+              queueKey,
+              initialQueue
+                .filter((entry) => entry.steeringAccepted)
+                .map((entry) => entry.id),
+            );
+            window.setTimeout(scheduleNextSend, 1000);
+            return;
+          } catch {
+            if (signal.aborted) return;
+            // Preserve the submitting marker and reconcile history before any
+            // retry; the server may have accepted the request already.
+            window.setTimeout(scheduleNextSend, 3000);
+            return;
+          }
+        }
+        if (initialHead?.status === "sending") {
+          await recoverSendingQueueHead(
+            sessionApi.getRealIdForSession(queueSessionId) || queueSessionId,
+            signal,
+            next.agentId || selectedAgent,
+            queueKey,
+            i18n.t("chat.queue.sendFailed"),
+          );
+        }
         // Re-check: another tab may have already removed this item via
         // broadcast, or a session switch may have happened.
         const fresh = useMessageQueueStore.getState().getQueue(queueKey);
@@ -3647,9 +3802,11 @@ export default function ChatPage() {
           : undefined,
       );
       if (BATCH_INPUT_KEY in requestBody) {
-        const { [BATCH_INPUT_KEY]: _batchInput, ...publicRequest } =
-          requestBody;
-        requestBody = publicRequest;
+        requestBody = Object.fromEntries(
+          Object.entries(requestBody).filter(
+            ([key]) => key !== BATCH_INPUT_KEY,
+          ),
+        );
       }
       let projectSessionId: string | null = null;
       let appliedProjectDir: string | null = null;

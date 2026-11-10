@@ -1453,7 +1453,10 @@ describe("ChatPage coverage", () => {
         );
     }
 
-    async function renderRunningQueue(preselected = false) {
+    async function renderRunningQueue(
+      preselected = false,
+      queries: string[] = ["QUEUE_FIRST", "QUEUE_SECOND"],
+    ) {
       mockSdkLoading.mockReturnValue(true);
       mockQueuePanelEnabled.mockReturnValue(true);
       mockGetChatStatus.mockResolvedValue({ status: "running" });
@@ -1493,7 +1496,7 @@ describe("ChatPage coverage", () => {
       await screen.findByTestId("chat-ui");
       await act(async () => {});
       await act(async () => {
-        for (const query of ["QUEUE_FIRST", "QUEUE_SECOND"]) {
+        for (const query of queries) {
           expect(await capturedOptions.sender.beforeSubmit({ query })).toEqual({
             proceed: false,
             clear: true,
@@ -1505,7 +1508,7 @@ describe("ChatPage coverage", () => {
           .getState()
           .getQueue(chatId)
           .map((item) => item.text),
-      ).toEqual(["QUEUE_FIRST", "QUEUE_SECOND"]);
+      ).toEqual(queries);
       return view;
     }
 
@@ -1548,6 +1551,111 @@ describe("ChatPage coverage", () => {
           ),
       ).toBe(false);
     }
+
+    it("steers a later queue item while an earlier accepted steer is still waiting for the next model request", async () => {
+      const view = await renderRunningQueue(true, ["QUEUE_EARLY"]);
+      try {
+        await waitFor(() => expect(steeringPosts()).toHaveLength(1), {
+          timeout: 1800,
+        });
+        const firstBody = JSON.parse(String(steeringPosts()[0][1]?.body));
+        expect(
+          firstBody.input.map(
+            (entry: { content: Array<{ text: string }> }) =>
+              entry.content[0].text,
+          ),
+        ).toEqual(["QUEUE_EARLY"]);
+        expect(
+          useMessageQueueStore.getState().getQueue(chatId)[0],
+        ).toMatchObject({ status: "sending", steeringAccepted: true });
+
+        const firstItem = useMessageQueueStore.getState().getQueue(chatId)[0];
+        act(() => {
+          useMessageQueueStore.getState().enqueue(chatId, {
+            text: "QUEUE_LATE",
+            agentId: firstItem.agentId,
+            backendSessionId: firstItem.backendSessionId,
+            userId: firstItem.userId,
+            channel: firstItem.channel,
+            requestContext: firstItem.requestContext,
+            bizParams: firstItem.bizParams,
+          });
+        });
+        await waitFor(
+          () => {
+            const current = useMessageQueueStore.getState().getQueue(chatId);
+            if (steeringPosts().length !== 2) {
+              throw new Error(
+                `posts=${steeringPosts().length} queue=${JSON.stringify(
+                  current.map(
+                    ({
+                      text,
+                      status,
+                      steeringAccepted,
+                      backendSessionId,
+                      agentId,
+                    }) => ({
+                      text,
+                      status,
+                      steeringAccepted,
+                      backendSessionId,
+                      agentId,
+                    }),
+                  ),
+                )} options=${JSON.stringify(
+                  useMessageQueueStore.getState().getSendOptions(chatId),
+                )} state=${useMessageQueueStore
+                  .getState()
+                  .getRunState(chatId)}`,
+              );
+            }
+          },
+          { timeout: 1800 },
+        );
+        const secondBody = JSON.parse(String(steeringPosts()[1][1]?.body));
+        expect(
+          secondBody.input.map(
+            (entry: { content: Array<{ text: string }> }) =>
+              entry.content[0].text,
+          ),
+        ).toEqual(["QUEUE_LATE"]);
+        const acceptedItems = useMessageQueueStore.getState().getQueue(chatId);
+        expect(
+          acceptedItems.map((item) => [
+            item.text,
+            item.status,
+            item.steeringAccepted,
+          ]),
+        ).toEqual([
+          ["QUEUE_EARLY", "sending", true],
+          ["QUEUE_LATE", "sending", true],
+        ]);
+
+        // GET /chats returns the receipt one level inside the metadata envelope.
+        // The same history reconciliation used by the live poll removes each
+        // confirmed item even though the chat is still running.
+        act(() => {
+          useMessageQueueStore.getState().reconcileHistory(
+            chatId,
+            "default",
+            acceptedItems.map((item) => ({
+              role: "user",
+              metadata: {
+                original_id: `original-${item.clientMessageId}`,
+                metadata: {
+                  qwenpaw_client_message_id: item.clientMessageId,
+                  qwenpaw_tag: "external_user_query",
+                },
+              },
+            })),
+          );
+        });
+        expect(useMessageQueueStore.getState().getQueue(chatId)).toEqual([]);
+      } finally {
+        act(() => useMessageQueueStore.getState().clear(chatId));
+        view.unmount();
+      }
+    });
 
     it("sends the full ordered batch when options were selected before enqueueing during a run", async () => {
       const view = await renderRunningQueue(true);
